@@ -1,12 +1,12 @@
 [package]
-name = "gazer"
+name = "saccade"
 version = "0.1.0"
 edition = "2024"
 authors = ["Leo Matyushkin"]
 description = "Pure Rust eye tracking library"
 license = "MIT"
-repository = "https://github.com/matyushkin/gazer"
-keywords = ["eye-tracking", "gaze", "pupil", "computer-vision"]
+repository = "https://github.com/matyushkin/saccade"
+keywords = ["eye-tracking", "gaze", "pupil", "computer-vision", "saccade"]
 categories = ["computer-vision", "multimedia"]
 
 [dependencies]

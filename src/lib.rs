@@ -1,4 +1,4 @@
-//! # Gazer
+//! # Saccade
 //!
 //! Pure Rust eye tracking library.
 //!
