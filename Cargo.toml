@@ -10,3 +10,4 @@ keywords = ["eye-tracking", "gaze", "pupil", "computer-vision", "saccade"]
 categories = ["computer-vision", "multimedia"]
 
 [dependencies]
+nalgebra = "0.33"
