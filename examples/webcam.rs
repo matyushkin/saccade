@@ -12,8 +12,7 @@ use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use rustface::ImageData;
 use saccade::frame::GrayFrame;
-use saccade::pure::PureConfig;
-use saccade::tracker::{Tracker, TrackerConfig, TrackingMode};
+use saccade::timm::{self, TimmConfig};
 use std::time::Instant;
 
 const MODEL_PATH: &str = "seeta_fd_frontal_v1.0.bin";
@@ -132,24 +131,19 @@ fn main() {
     .expect("Failed to create window");
     window.set_target_fps(60);
 
-    // Eye trackers
-    let tracker_config = TrackerConfig {
-        pure: PureConfig {
-            canny_low: 10.0,
-            canny_high: 30.0,
-            ..PureConfig::default()
-        },
-        ..TrackerConfig::default()
+    // Timm & Barth config — tuned for small webcam eye ROIs
+    let timm_config = TimmConfig {
+        gradient_threshold: 0.2, // lower threshold to catch subtle gradients
+        use_weight_map: true,
+        weight_blur_sigma: 2.0,
     };
-    let mut left_tracker = Tracker::new(tracker_config.clone());
-    let mut right_tracker = Tracker::new(tracker_config);
 
-    // Smoothers — low alpha = more smoothing
-    let mut face_smooth = SmoothRect::new(0.3);
-    let mut left_eye_smooth = SmoothRect::new(0.3);
-    let mut right_eye_smooth = SmoothRect::new(0.3);
-    let mut left_pupil_smooth = SmoothPoint::new(0.2);
-    let mut right_pupil_smooth = SmoothPoint::new(0.2);
+    // Smoothers
+    let mut face_smooth = SmoothRect::new(0.25);
+    let mut left_eye_smooth = SmoothRect::new(0.25);
+    let mut right_eye_smooth = SmoothRect::new(0.25);
+    let mut left_pupil_smooth = SmoothPoint::new(0.4); // less lag
+    let mut right_pupil_smooth = SmoothPoint::new(0.4);
 
     let mut frame_buf = vec![0u32; cam_w * cam_h];
     let mut fps_counter = FpsCounter::new();
@@ -225,12 +219,12 @@ fn main() {
 
             draw_rect(&mut frame_buf, cam_w, cam_h, sfx, sfy, sfw, sfh, 0xFFFF00);
 
-            // Eye regions from smoothed face
-            let eye_y = sfy + sfh * 28 / 100;
-            let eye_h = sfh * 25 / 100;
-            let left_eye_x = sfx + sfw * 8 / 100;
-            let right_eye_x = sfx + sfw * 52 / 100;
-            let eye_w = sfw * 40 / 100;
+            // Tighter eye regions — less eyebrow, more focused on eye
+            let eye_y = sfy + sfh * 32 / 100;
+            let eye_h = sfh * 18 / 100;
+            let left_eye_x = sfx + sfw * 10 / 100;
+            let right_eye_x = sfx + sfw * 55 / 100;
+            let eye_w = sfw * 35 / 100;
 
             // Smooth eye ROIs
             left_eye_smooth.update(left_eye_x as f64, eye_y as f64, eye_w as f64, eye_h as f64);
@@ -239,37 +233,30 @@ fn main() {
             let (lx, ly, lw, lh) = left_eye_smooth.get();
             let (rx, ry, rw, rh) = right_eye_smooth.get();
 
-            // Track left eye
-            if let Some(result) = track_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &mut left_tracker) {
+            // Track left eye with Timm & Barth
+            if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, lx, ly, lw, lh, 0x00FF00);
-                if let Some(pupil) = result.pupil {
-                    let abs_x = lx as f64 + pupil.cx;
-                    let abs_y = ly as f64 + pupil.cy;
-                    left_pupil_smooth.update(abs_x, abs_y);
+                if conf > 0.05 {
+                    left_pupil_smooth.update(cx, cy);
                     let (px, py) = left_pupil_smooth.get();
-                    draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0xFF0000, result.mode);
+                    draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0xFF0000);
                 }
             }
 
-            // Track right eye
-            if let Some(result) = track_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &mut right_tracker) {
+            // Track right eye with Timm & Barth
+            if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, rx, ry, rw, rh, 0x00FF00);
-                if let Some(pupil) = result.pupil {
-                    let abs_x = rx as f64 + pupil.cx;
-                    let abs_y = ry as f64 + pupil.cy;
-                    right_pupil_smooth.update(abs_x, abs_y);
+                if conf > 0.05 {
+                    right_pupil_smooth.update(cx, cy);
                     let (px, py) = right_pupil_smooth.get();
-                    draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0x00FFFF, result.mode);
+                    draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0x00FFFF);
                 }
             }
         } else {
             no_face_count += 1;
             if no_face_count > 30 {
-                // Lost face for >1 second — reset
-                left_tracker.reset();
-                right_tracker.reset();
-                left_pupil_smooth = SmoothPoint::new(0.2);
-                right_pupil_smooth = SmoothPoint::new(0.2);
+                left_pupil_smooth = SmoothPoint::new(0.4);
+                right_pupil_smooth = SmoothPoint::new(0.4);
                 no_face_count = 0;
             } else if face_smooth.initialized {
                 // Use last known face position for a few frames
@@ -300,12 +287,9 @@ fn main() {
     println!("\nDone.");
 }
 
-struct TrackResult {
-    pupil: Option<saccade::ellipse::Ellipse>,
-    mode: TrackingMode,
-}
-
-fn track_eye(
+/// Detect eye center using Timm & Barth with contrast enhancement.
+/// Returns (abs_x, abs_y, confidence) in frame coordinates.
+fn detect_eye(
     gray: &[u8],
     img_w: usize,
     img_h: usize,
@@ -313,12 +297,13 @@ fn track_eye(
     roi_y: usize,
     roi_w: usize,
     roi_h: usize,
-    tracker: &mut Tracker,
-) -> Option<TrackResult> {
-    if roi_x + roi_w > img_w || roi_y + roi_h > img_h || roi_w < 20 || roi_h < 15 {
+    config: &TimmConfig,
+) -> Option<(f64, f64, f64)> {
+    if roi_x + roi_w > img_w || roi_y + roi_h > img_h || roi_w < 10 || roi_h < 8 {
         return None;
     }
 
+    // Extract eye region
     let mut eye_data = vec![0u8; roi_w * roi_h];
     for y in 0..roi_h {
         let src_start = (roi_y + y) * img_w + roi_x;
@@ -327,13 +312,22 @@ fn track_eye(
             .copy_from_slice(&gray[src_start..src_start + roi_w]);
     }
 
-    let frame = GrayFrame::new(roi_w as u32, roi_h as u32, &eye_data);
-    let result = tracker.track(&frame);
+    // Contrast stretch (min-max normalization) to improve gradient quality
+    let min_val = *eye_data.iter().min().unwrap_or(&0);
+    let max_val = *eye_data.iter().max().unwrap_or(&255);
+    if max_val > min_val + 10 {
+        let range = (max_val - min_val) as f32;
+        for p in &mut eye_data {
+            *p = ((*p as f32 - min_val as f32) / range * 255.0) as u8;
+        }
+    }
 
-    Some(TrackResult {
-        pupil: result.pupil,
-        mode: result.mode,
-    })
+    let frame = GrayFrame::new(roi_w as u32, roi_h as u32, &eye_data);
+    let result = timm::detect_center(&frame, config);
+
+    let abs_x = roi_x as f64 + result.x;
+    let abs_y = roi_y as f64 + result.y;
+    Some((abs_x, abs_y, result.confidence))
 }
 
 fn draw_rect(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize, rh: usize, color: u32) {
@@ -355,12 +349,8 @@ fn draw_rect(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize,
     }
 }
 
-fn draw_crosshair(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, color: u32, mode: TrackingMode) {
-    let size: i32 = match mode {
-        TrackingMode::Fast => 4,
-        TrackingMode::Precise => 6,
-        TrackingMode::FullScan => 8,
-    };
+fn draw_crosshair(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, color: u32) {
+    let size: i32 = 6;
     for d in -size..=size {
         let x = cx as i32 + d;
         if x >= 0 && (x as usize) < w && cy < h {
