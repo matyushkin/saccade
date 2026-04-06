@@ -17,3 +17,6 @@ pub mod blink;
 pub mod classify;
 pub mod kalman;
 pub mod timm;
+pub mod ellipse;
+pub mod edge;
+pub mod pure;
