@@ -243,14 +243,17 @@ fn run_pfld(s: &mut Session, g: &[u8], w: usize, h: usize, fx: usize, fy: usize,
 struct OcecEyeState {
     rx: f64, ry: f64, rw: f64, rh: f64,
     init: bool,
+    frozen: bool, // true = eye closed, don't update ROI
 }
 impl OcecEyeState {
-    fn new() -> Self { Self { rx: 0.0, ry: 0.0, rw: 0.0, rh: 0.0, init: false } }
+    fn new() -> Self { Self { rx: 0.0, ry: 0.0, rw: 0.0, rh: 0.0, init: false, frozen: false } }
     fn update(&mut self, rx: f64, ry: f64, rw: f64, rh: f64) {
         if !self.init { self.rx=rx; self.ry=ry; self.rw=rw; self.rh=rh; self.init=true; }
         else { let a=0.3; self.rx=a*rx+(1.0-a)*self.rx; self.ry=a*ry+(1.0-a)*self.ry; self.rw=a*rw+(1.0-a)*self.rw; self.rh=a*rh+(1.0-a)*self.rh; }
     }
     fn get(&self) -> (usize,usize,usize,usize) { (self.rx.round() as usize, self.ry.round() as usize, self.rw.round().max(4.0) as usize, self.rh.round().max(4.0) as usize) }
+    fn freeze(&mut self) { self.frozen = true; }
+    fn unfreeze(&mut self) { self.frozen = false; }
 }
 
 fn run_ocec_lm(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], si: usize, ei: usize, roi_state: &mut OcecEyeState) -> f32 {
@@ -266,7 +269,11 @@ fn run_ocec_lm(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], 
     let new_rw = ((max_x - min_x) + 2.0*mx).max(4.0) as f64;
     let new_rh = ((max_y - min_y) + 2.0*my).max(4.0) as f64;
 
-    roi_state.update(new_rx, new_ry, new_rw, new_rh);
+    // Only update ROI if eye was open last frame — freeze ROI when closed
+    // so OCEC keeps seeing the same region and stays in "closed" state
+    if !roi_state.frozen {
+        roi_state.update(new_rx, new_ry, new_rw, new_rh);
+    }
     let (rx, ry, rw, rh) = roi_state.get();
     if rx+rw>w || ry+rh>h { return 1.0; }
 
@@ -282,9 +289,17 @@ fn run_ocec_lm(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], 
         Ok(t) => t, Err(_) => return 1.0,
     };
     let out = match s.run(ort::inputs![t]) { Ok(o) => o, Err(_) => return 1.0 };
-    out.iter().next().and_then(|(_, v)| {
+    let val = out.iter().next().and_then(|(_, v)| {
         v.try_extract_tensor::<f32>().ok().map(|(_, d)| if d.is_empty() { 1.0 } else { d[0] })
-    }).unwrap_or(1.0)
+    }).unwrap_or(1.0);
+
+    // Freeze ROI when eye is closed, unfreeze when open
+    if val < 0.3 {
+        roi_state.freeze();
+    } else {
+        roi_state.unfreeze();
+    }
+    val
 }
 
 fn run_gaze(s: &mut Session, rgb: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<(f32,f32)> {
