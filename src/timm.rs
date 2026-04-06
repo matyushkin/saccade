@@ -51,6 +51,9 @@ impl Default for TimmConfig {
 ///
 /// Input should be a cropped eye region (e.g., 40×30 to 160×120).
 /// Smaller inputs are faster. For sub-ms performance, use ~40×30.
+///
+/// For larger inputs (>80px wide), uses coarse-to-fine search:
+/// first scans every 4th pixel, then refines in a 7×7 neighborhood.
 pub fn detect_center(frame: &dyn Frame, config: &TimmConfig) -> GradientCenter {
     let w = frame.width() as usize;
     let h = frame.height() as usize;
@@ -97,66 +100,143 @@ pub fn detect_center(frame: &dyn Frame, config: &TimmConfig) -> GradientCenter {
         vec![1.0; w * h]
     };
 
-    // Main objective: for each candidate center, accumulate weighted dot products
-    let mut best_val = f64::NEG_INFINITY;
-    let mut best_x = w as f64 / 2.0;
-    let mut best_y = h as f64 / 2.0;
+    // Accumulator-based approach: O(G × W × H) instead of O(W² × H²).
+    //
+    // For each gradient point p, we compute its weighted contribution to every
+    // candidate center c:  w(p) · max(0, d(p,c)·g(p))²
+    //
+    // This inverts the loop order: outer = gradient points, inner = candidate centers.
+    // Each gradient point "votes" for all centers along its gradient direction.
+    let mut accum = vec![0.0f32; w * h];
 
-    for cy in 1..h - 1 {
-        for cx in 1..w - 1 {
-            let mut sum = 0.0f64;
+    // Pre-collect gradient points to avoid branch in hot loop
+    let mut grad_points: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
+    for py in 1..h - 1 {
+        for px in 1..w - 1 {
+            let pidx = py * w + px;
+            let m = mag[pidx];
+            if m < mag_threshold {
+                continue;
+            }
+            let gx_n = gx[pidx] / m;
+            let gy_n = gy[pidx] / m;
+            let wt = weights[pidx];
+            grad_points.push((px, py, gx_n, gy_n, wt));
+        }
+    }
 
-            for py in 1..h - 1 {
-                for px in 1..w - 1 {
-                    let pidx = py * w + px;
-                    if mag[pidx] < mag_threshold {
-                        continue;
-                    }
+    // Coarse-to-fine: use step>1 for large frames, then refine
+    let coarse_step = if w > 80 || h > 80 { 4 } else { 1 };
 
-                    // Displacement vector from candidate center to gradient point
-                    let dx = px as f64 - cx as f64;
-                    let dy = py as f64 - cy as f64;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist < 1.0 {
-                        continue;
-                    }
-                    let dx_n = dx / dist;
-                    let dy_n = dy / dist;
+    // Coarse pass: use subsampled gradient points for speed
+    let coarse_grads: Vec<_> = if coarse_step > 1 {
+        grad_points.iter().step_by(coarse_step).copied().collect()
+    } else {
+        grad_points.clone()
+    };
+    accumulate_votes(&coarse_grads, &mut accum, w, h, coarse_step);
 
-                    // Normalized gradient
-                    let gm = mag[pidx] as f64;
-                    let gx_n = gx[pidx] as f64 / gm;
-                    let gy_n = gy[pidx] as f64 / gm;
+    // Find coarse best
+    let mut best_val = 0.0f32;
+    let mut best_x = w / 2;
+    let mut best_y = h / 2;
 
-                    // Dot product
-                    let dot = dx_n * gx_n + dy_n * gy_n;
-                    if dot > 0.0 {
-                        sum += weights[pidx] as f64 * dot * dot;
-                    }
+    for cy in (1..h - 1).step_by(coarse_step) {
+        for cx in (1..w - 1).step_by(coarse_step) {
+            let val = accum[cy * w + cx];
+            if val > best_val {
+                best_val = val;
+                best_x = cx;
+                best_y = cy;
+            }
+        }
+    }
+
+    // Fine pass: refine in neighborhood around coarse best
+    if coarse_step > 1 {
+        let margin = coarse_step + 3;
+        let fy0 = best_y.saturating_sub(margin).max(1);
+        let fy1 = (best_y + margin + 1).min(h - 1);
+        let fx0 = best_x.saturating_sub(margin).max(1);
+        let fx1 = (best_x + margin + 1).min(w - 1);
+
+        // Re-accumulate at pixel resolution in the neighborhood
+        let mut fine_accum = vec![0.0f32; w * h];
+        for &(px, py, gx_n, gy_n, wt) in &grad_points {
+            let px_f = px as f32;
+            let py_f = py as f32;
+            for cy in fy0..fy1 {
+                let dy = py_f - cy as f32;
+                let dy_g = dy * gy_n;
+                for cx in fx0..fx1 {
+                    let dx = px_f - cx as f32;
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq < 1.0 { continue; }
+                    let dot_unnorm = dx * gx_n + dy_g;
+                    if dot_unnorm <= 0.0 { continue; }
+                    fine_accum[cy * w + cx] += wt * dot_unnorm * dot_unnorm / dist_sq;
                 }
             }
+        }
 
-            if sum > best_val {
-                best_val = sum;
-                best_x = cx as f64;
-                best_y = cy as f64;
+        for cy in fy0..fy1 {
+            for cx in fx0..fx1 {
+                let val = fine_accum[cy * w + cx];
+                if val > best_val {
+                    best_val = val;
+                    best_x = cx;
+                    best_y = cy;
+                }
             }
         }
     }
 
     // Normalize confidence to [0, 1]
-    let num_gradient_pixels = mag.iter().filter(|&&m| m >= mag_threshold).count() as f64;
-    let max_possible = num_gradient_pixels * weights.iter().cloned().fold(0.0f32, f32::max) as f64;
+    let max_weight = weights.iter().cloned().fold(0.0f32, f32::max);
+    let num_gradient_pixels = grad_points.len() as f64;
+    let max_possible = num_gradient_pixels * max_weight as f64;
     let confidence = if max_possible > 0.0 {
-        (best_val / max_possible).clamp(0.0, 1.0)
+        (best_val as f64 / max_possible).clamp(0.0, 1.0)
     } else {
         0.0
     };
 
     GradientCenter {
-        x: best_x,
-        y: best_y,
+        x: best_x as f64,
+        y: best_y as f64,
         confidence,
+    }
+}
+
+/// Accumulate gradient votes into the accumulator map with given step size.
+fn accumulate_votes(
+    grad_points: &[(usize, usize, f32, f32, f32)],
+    accum: &mut [f32],
+    w: usize,
+    h: usize,
+    step: usize,
+) {
+    for &(px, py, gx_n, gy_n, wt) in grad_points {
+        let px_f = px as f32;
+        let py_f = py as f32;
+
+        for cy in (1..h - 1).step_by(step) {
+            let dy = py_f - cy as f32;
+            let dy_g = dy * gy_n;
+
+            for cx in (1..w - 1).step_by(step) {
+                let dx = px_f - cx as f32;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq < 1.0 {
+                    continue;
+                }
+                let dot_unnorm = dx * gx_n + dy_g;
+                if dot_unnorm <= 0.0 {
+                    continue;
+                }
+                accum[cy * w + cx] += wt * dot_unnorm * dot_unnorm / dist_sq;
+            }
+        }
     }
 }
 
