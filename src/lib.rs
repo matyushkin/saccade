@@ -21,3 +21,4 @@ pub mod ellipse;
 pub mod edge;
 pub mod pure;
 pub mod tracker;
+pub mod ear;

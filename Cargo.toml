@@ -24,7 +24,7 @@ name = "diag"
 required-features = ["demo"]
 
 [features]
-demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image"]
+demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image", "dep:ort"]
 
 [dependencies.nokhwa]
 version = "0.10"
@@ -41,4 +41,8 @@ optional = true
 
 [dependencies.image]
 version = "0.25"
+optional = true
+
+[dependencies.ort]
+version = "2.0.0-rc.12"
 optional = true
