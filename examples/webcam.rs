@@ -147,9 +147,22 @@ fn main() {
     let mut left_pupil_smooth = SmoothPoint::new(0.4); // less lag
     let mut right_pupil_smooth = SmoothPoint::new(0.4);
 
-    // Blink detectors and event classifier
+    // Blink detectors
     let mut left_blink = BlinkDetector::new();
+    left_blink.confidence_threshold = 0.06; // dark_ratio below this = eye closed
     let mut right_blink = BlinkDetector::new();
+    right_blink.confidence_threshold = 0.06;
+
+    // Smooth openness signal before feeding to blink detector
+    let mut left_openness_ema = 0.5f64;
+    let mut right_openness_ema = 0.5f64;
+    let openness_alpha = 0.4;
+
+    // Per-eye adaptive threshold calibration
+    let mut left_baseline_sum = 0.0f64;
+    let mut right_baseline_sum = 0.0f64;
+    let mut calibration_frames = 0u32;
+    let calibration_period = 45; // ~3 seconds at 15fps
     let mut classifier = IVTClassifier::default_params();
     let start_time = Instant::now();
 
@@ -246,37 +259,59 @@ fn main() {
             let (rx, ry, rw, rh) = right_eye_smooth.get();
 
             // Track left eye
-            let left_conf = if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &timm_config) {
+            let left_openness = if let Some((cx, cy, dark_ratio)) = detect_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, lx, ly, lw, lh, 0x00FF00);
-                if conf > 0.05 {
+
+                // Smooth the dark_ratio signal
+                left_openness_ema = openness_alpha * dark_ratio + (1.0 - openness_alpha) * left_openness_ema;
+
+                if left_openness_ema > 0.06 {
                     left_pupil_smooth.update(cx, cy);
                     let (px, py) = left_pupil_smooth.get();
                     draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0xFF0000);
-
-                    // Feed classifier with average pupil position
                     classifier.update(cx, cy, now_ms);
                 }
-                conf
+                left_openness_ema
             } else {
                 0.0
             };
 
             // Track right eye
-            let right_conf = if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &timm_config) {
+            let right_openness = if let Some((cx, cy, dark_ratio)) = detect_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, rx, ry, rw, rh, 0x00FF00);
-                if conf > 0.05 {
+
+                right_openness_ema = openness_alpha * dark_ratio + (1.0 - openness_alpha) * right_openness_ema;
+
+                if right_openness_ema > 0.06 {
                     right_pupil_smooth.update(cx, cy);
                     let (px, py) = right_pupil_smooth.get();
                     draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0x00FFFF);
                 }
-                conf
+                right_openness_ema
             } else {
                 0.0
             };
 
+            // Adaptive calibration: learn per-eye baseline during first N frames
+            if calibration_frames < calibration_period {
+                left_baseline_sum += left_openness;
+                right_baseline_sum += right_openness;
+                calibration_frames += 1;
+
+                if calibration_frames == calibration_period {
+                    let left_base = left_baseline_sum / calibration_period as f64;
+                    let right_base = right_baseline_sum / calibration_period as f64;
+                    // Threshold = 50% of baseline (closed eye has ~20-30% of open dark ratio)
+                    left_blink.confidence_threshold = (left_base * 0.5).max(0.03);
+                    right_blink.confidence_threshold = (right_base * 0.5).max(0.03);
+                    eprintln!("\nCalibrated: L_base={left_base:.3} thresh={:.3} | R_base={right_base:.3} thresh={:.3}",
+                        left_blink.confidence_threshold, right_blink.confidence_threshold);
+                }
+            }
+
             // Update blink detectors
-            let left_eye_state = left_blink.update(left_conf, now_ms);
-            let right_eye_state = right_blink.update(right_conf, now_ms);
+            let left_eye_state = left_blink.update(left_openness, now_ms);
+            let right_eye_state = right_blink.update(right_openness, now_ms);
 
             // Draw eye state indicators (colored dots in top-right)
             let state_y = 15;
@@ -332,7 +367,9 @@ fn main() {
 }
 
 /// Detect eye center using Timm & Barth with contrast enhancement.
-/// Returns (abs_x, abs_y, confidence) in frame coordinates.
+/// Returns (abs_x, abs_y, openness) in frame coordinates.
+/// `openness` is based on pixel standard deviation in the ROI:
+/// high std = open eye (dark pupil + bright sclera), low std = closed.
 fn detect_eye(
     gray: &[u8],
     img_w: usize,
@@ -356,7 +393,17 @@ fn detect_eye(
             .copy_from_slice(&gray[src_start..src_start + roi_w]);
     }
 
-    // Contrast stretch (min-max normalization) to improve gradient quality
+    // Compute eye openness using min-region darkness ratio.
+    // An open eye has a dark pupil region (bottom 10% of brightness).
+    // A closed eye is more uniform (eyelid color).
+    let n = eye_data.len();
+    let mean = eye_data.iter().map(|&p| p as u32).sum::<u32>() / n as u32;
+    // Dark threshold: pixels below 60% of mean brightness
+    let dark_thresh = (mean as f64 * 0.6) as u8;
+    let dark_count = eye_data.iter().filter(|&&p| p < dark_thresh).count();
+    let dark_ratio = dark_count as f64 / n as f64;
+
+    // Contrast stretch
     let min_val = *eye_data.iter().min().unwrap_or(&0);
     let max_val = *eye_data.iter().max().unwrap_or(&255);
     if max_val > min_val + 10 {
@@ -371,7 +418,8 @@ fn detect_eye(
 
     let abs_x = roi_x as f64 + result.x;
     let abs_y = roi_y as f64 + result.y;
-    Some((abs_x, abs_y, result.confidence))
+    // dark_ratio: ~0.10-0.25 for open eye (pupil visible), ~0.01-0.05 for closed
+    Some((abs_x, abs_y, dark_ratio))
 }
 
 fn draw_rect(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize, rh: usize, color: u32) {

@@ -19,6 +19,10 @@ image = "0.25"
 name = "webcam"
 required-features = ["demo"]
 
+[[example]]
+name = "diag"
+required-features = ["demo"]
+
 [features]
 demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image"]
 
