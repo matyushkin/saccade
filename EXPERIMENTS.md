@@ -33,7 +33,8 @@ screen coordinates. Auto-tune lambda via leave-one-out cross-validation.
 
 **Files:** `examples/webgazer.rs`, `src/ridge.rs`
 
-**Best result:** Mean **161 px** (~2.5°), max 242 px, coverage 94-116%.
+**Best result with WHITE background (E10):** Mean **142 px** (~2.2°), max 193 px, coverage 87/109%.
+**Best with black background:** Mean 161 px, max 242 px, coverage 94-116%.
 
 **Variants tried:**
 - 18 calibration samples (2 per point × 9 points): 261 px
@@ -158,6 +159,31 @@ A correct Sugano implementation matched to a specific CNN's training would take
 
 ---
 
+### E10. White background lighting hack — **BIG WIN**
+
+**Approach:** Clear screen buffer to white (0xFFFFFF) instead of black during
+calibration/validation/running. The screen acts as a fill light, illuminating
+the user's face and improving pupil/iris contrast.
+
+**Hypothesis:** Standard practice in research eye tracking — bright displays
+increase SNR for pupil detection. We were tracking eyes against a dark screen
+which constricted them and reduced contrast.
+
+**Result:** Mean error **161 → 142 px** (-12%), max **242 → 193 px** (-20%),
+median **190 → 151 px** (-21%), FPS **9 → 10-11**. All errors <200 px.
+
+**Why it works:**
+- More light on the face → better pupil/iris contrast
+- Pupils slightly constricted → more stable position
+- Brighter image → higher SNR features
+- Lower GPU compositor load → +10% FPS
+
+**Cost:** Zero. Just changed `0` → `0xFFFFFF` in two places.
+
+**Lesson:** Sometimes a 1-line change beats weeks of algorithmic work.
+
+---
+
 ### E9. PPERV (head-pose-invariant pupil position)
 
 **Approach (deprecated):** Compute pupil position relative to eye corners,
@@ -241,11 +267,12 @@ geometric approach.
 
 | Approach | Mean error | When to use |
 |----------|-----------|-------------|
-| **`webgazer.rs` pixel ridge, 45 cal, λ=auto** | **161 px / 2.5°** | Default — working baseline |
+| **`webgazer.rs` pixel ridge, 45 cal, λ=auto, WHITE BG** | **142 px / 2.2°** | Default — beats WebGazer.js |
 | WebGazer.js (reference) | ~175 px / 4° | Browser, has continuous learning |
 | `webgazer_cnn.rs` (any CNN config) | 300-700 px | Don't use until Sugano fixed |
 
-**Current state:** roughly at WebGazer.js parity (slightly better short-session
-mean, worse worst-case, same order of magnitude). Beating it consistently
-requires production-quality Sugano normalization or person-specific CNN
-fine-tuning, both multi-week efforts.
+**Current state:** **Beats WebGazer.js** on mean error for short sessions
+(142 px vs ~175 px) thanks to the white background lighting trick. Worst case
+is comparable. Still no head-pose compensation, so head movement breaks
+calibration. Going to <100 px would require production Sugano + CNN, multi-week
+effort.
