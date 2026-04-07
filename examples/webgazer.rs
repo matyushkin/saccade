@@ -105,12 +105,10 @@ fn main() {
     window.set_target_fps(60);
     println!("Window opened. CLICK ON IT to give it focus, then press SPACE.");
 
-    // Ridge regressor — STRONG regularization
-    // Offline benchmark sweet spot: λ ∈ [1e6, 3e6] depending on session.
-    // 120 features with only ~18 samples → severe overfit without strong λ.
+    // Ridge regressor — moderate λ from multi-point benchmark (best at 1e4)
     let mut ridge_reg = RidgeRegressor::new(
-        50,
-        3e6,                 // very strong ridge — best on recent benchmark
+        200,                 // larger buffer — accumulate user clicks during use
+        1e4,                 // moderate ridge — best on multi-point validation
         BOTH_EYES_FEAT_LEN,
     );
 
@@ -132,12 +130,19 @@ fn main() {
     // Skip face detection on most frames (rustface ~30ms at 480x270)
     let mut frame_n = 0u64;
 
-    // Validation state — collect gaze samples while user looks at center
-    let mut validation_samples: Vec<(f64, f64)> = Vec::new();
-    let mut validation_start_ms: u64 = 0;
-    let validation_duration_ms: u64 = 3000;
-    let mut validation_error_px: f64 = 0.0;
-    let mut validation_error_std: f64 = 0.0;
+    // Multi-point validation: 5 different targets, click each one,
+    // we measure error vs prediction for each
+    let validation_targets: Vec<(f64, f64)> = vec![
+        (sw as f64 * 0.2, sh as f64 * 0.2),  // top-left interior
+        (sw as f64 * 0.8, sh as f64 * 0.2),  // top-right interior
+        (sw as f64 / 2.0, sh as f64 / 2.0),  // center
+        (sw as f64 * 0.2, sh as f64 * 0.8),  // bottom-left interior
+        (sw as f64 * 0.8, sh as f64 * 0.8),  // bottom-right interior
+    ];
+    let mut validation_idx = 0usize;
+    // Per-validation-point: collected (predicted, target) pairs
+    let mut validation_results: Vec<(f64, f64, f64, f64)> = Vec::new(); // (px, py, tx, ty)
+    let mut prev_val_mouse_down = false;
 
     // Session recording for offline replay/benchmarking
     let mut session = Session::new(sw as u32, sh as u32, ((sw / 2) as f32, (sh / 2) as f32));
@@ -360,11 +365,11 @@ fn main() {
                                 target_y: ty as f32,
                             });
                         }
-                        println!("\nCalibration done: {} samples. Validating accuracy...", ridge_reg.sample_count());
-                        validation_samples.clear();
+                        println!("\nCalibration done: {} samples. Now click each blue dot.", ridge_reg.sample_count());
+                        validation_idx = 0;
+                        validation_results.clear();
                         gaze_history.clear();
                         one_euro.reset();
-                        validation_start_ms = now_ms;
                     }
                     EventResult::Rejected => {
                         println!("  Capture rejected (no face detected — move into camera view)");
@@ -376,75 +381,83 @@ fn main() {
             }
         }
 
-        // --- Validation phase: user looks at center, we measure error ---
-        if calib.phase() == Phase::Validating {
-            let cx = sw / 2;
-            let cy = sh / 2;
+        // --- Multi-point validation: user CLICKS each validation target ---
+        if calib.phase() == Phase::Validating && validation_idx < validation_targets.len() {
+            let (vtx, vty) = validation_targets[validation_idx];
 
-            // Big stable target — user just stares at this
-            draw_filled_circle(&mut buf, sw, sh, cx, cy, 24, 0xFFFFFF);
-            draw_ring(&mut buf, sw, sh, cx, cy, 30, 0x00AAFF);
-            draw_ring(&mut buf, sw, sh, cx, cy, 31, 0x00AAFF);
-            draw_filled_circle(&mut buf, sw, sh, cx, cy, 5, 0xFF0000);
+            // Draw target — distinct from calibration (blue ring)
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 24, 0x00AAFF);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 30, 0xFFFFFF);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 31, 0xFFFFFF);
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 4, 0xFFFFFF);
 
-            // Predict and collect gaze (with same smoothing as Running phase)
-            if let Some(feats) = &current_features {
-                if let Some((raw_x, raw_y)) = ridge_reg.predict(feats) {
-                    let raw_gx = (raw_x as f64).clamp(0.0, sw as f64 - 1.0);
-                    let raw_gy = (raw_y as f64).clamp(0.0, sh as f64 - 1.0);
+            // Show progress dots for validation
+            for (i, &(px, py)) in validation_targets.iter().enumerate() {
+                let c = if i < validation_idx { 0x00FF00 }
+                        else if i == validation_idx { 0x00AAFF }
+                        else { 0x333333 };
+                draw_filled_circle(&mut buf, sw, sh, px as usize, py as usize, 6, c);
+            }
 
-                    // Apply same 16-point moving average + 1€ as Running phase
-                    gaze_history.push((raw_gx, raw_gy));
-                    if gaze_history.len() > SMOOTHING_WINDOW { gaze_history.remove(0); }
-                    let n = gaze_history.len() as f64;
-                    let avg_x = gaze_history.iter().map(|p| p.0).sum::<f64>() / n;
-                    let avg_y = gaze_history.iter().map(|p| p.1).sum::<f64>() / n;
-                    let t_sec = now_ms as f64 / 1000.0;
-                    let (sm_x, sm_y) = one_euro.filter((avg_x, avg_y), t_sec);
+            // Click on validation target → capture sample
+            let val_mouse_down = window.get_mouse_down(MouseButton::Left);
+            let val_mouse_edge = val_mouse_down && !prev_val_mouse_down;
+            prev_val_mouse_down = val_mouse_down;
 
-                    // Skip first 1000ms (smoothing window fill + settling)
-                    if now_ms.saturating_sub(validation_start_ms) > 1000 {
-                        validation_samples.push((sm_x, sm_y));
-                        // Also record into session for offline replay
-                        session.validation.push(ValidFrame { features: feats.clone() });
+            let mp = window.get_mouse_pos(MouseMode::Discard).unwrap_or((0.0, 0.0));
+            let click_dist = ((mp.0 as f64 - vtx).powi(2) + (mp.1 as f64 - vty).powi(2)).sqrt();
+            if val_mouse_edge && click_dist < 80.0 {
+                if let Some(feats) = &current_features {
+                    if let Some((raw_x, raw_y)) = ridge_reg.predict(feats) {
+                        let px = (raw_x as f64).clamp(0.0, sw as f64 - 1.0);
+                        let py = (raw_y as f64).clamp(0.0, sh as f64 - 1.0);
+                        validation_results.push((px, py, vtx, vty));
+                        session.validation.push(ValidFrame {
+                            features: feats.clone(),
+                            target_x: vtx as f32,
+                            target_y: vty as f32,
+                        });
+                        let err = ((px - vtx).powi(2) + (py - vty).powi(2)).sqrt();
+                        println!("  Validation point {}/{}: predicted ({px:.0}, {py:.0}), target ({vtx:.0}, {vty:.0}), error {err:.0} px",
+                            validation_idx + 1, validation_targets.len(), );
                     }
-                    // Show live gaze cursor (smoothed)
-                    draw_filled_circle(&mut buf, sw, sh, sm_x as usize, sm_y as usize, 6, 0x00FF00);
+                    validation_idx += 1;
                 }
             }
 
-            // Progress bar
-            let elapsed = now_ms.saturating_sub(validation_start_ms);
-            let progress = (elapsed as f64 / validation_duration_ms as f64).min(1.0);
-            let bar_w = (sw as f64 * 0.5) as usize;
-            let bar_x = (sw - bar_w) / 2;
-            let bar_y = sh - 60;
-            for x in 0..bar_w { for y in 0..10 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0x222222; }}}
-            let filled = (bar_w as f64 * progress) as usize;
-            for x in 0..filled { for y in 0..10 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0x00AAFF; }}}
+            // After all validation points clicked, compute aggregate
+            if validation_idx >= validation_targets.len() {
+                let errors: Vec<f64> = validation_results.iter()
+                    .map(|(px, py, tx, ty)| ((px-tx).powi(2)+(py-ty).powi(2)).sqrt())
+                    .collect();
+                if !errors.is_empty() {
+                    let n = errors.len() as f64;
+                    let mean_err = errors.iter().sum::<f64>() / n;
+                    let max_err = errors.iter().cloned().fold(0.0f64, f64::max);
+                    let mut sorted = errors.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let median = sorted[sorted.len() / 2];
 
-            // Finish validation
-            if elapsed >= validation_duration_ms {
-                if validation_samples.len() >= 5 {
-                    let n = validation_samples.len() as f64;
-                    let mean_x = validation_samples.iter().map(|p| p.0).sum::<f64>() / n;
-                    let mean_y = validation_samples.iter().map(|p| p.1).sum::<f64>() / n;
-                    let target = (cx as f64, cy as f64);
-                    let mean_err = ((mean_x - target.0).powi(2) + (mean_y - target.1).powi(2)).sqrt();
-                    let var: f64 = validation_samples.iter()
-                        .map(|p| (p.0 - mean_x).powi(2) + (p.1 - mean_y).powi(2))
-                        .sum::<f64>() / n;
-                    let std_dev = var.sqrt();
-                    validation_error_px = mean_err;
-                    validation_error_std = std_dev;
-                    println!("\n=== Validation result ===");
-                    println!("  Samples: {}", validation_samples.len());
-                    println!("  Mean error: {mean_err:.0} px");
-                    println!("  Precision (std): {std_dev:.0} px");
+                    println!("\n=== Multi-point validation ===");
+                    println!("  Points: {}", errors.len());
+                    println!("  Mean error:   {mean_err:.0} px");
+                    println!("  Median error: {median:.0} px");
+                    println!("  Max error:    {max_err:.0} px");
+
+                    // Compute coverage: range of predictions vs range of targets
+                    let p_x: Vec<f64> = validation_results.iter().map(|r| r.0).collect();
+                    let p_y: Vec<f64> = validation_results.iter().map(|r| r.1).collect();
+                    let t_x: Vec<f64> = validation_results.iter().map(|r| r.2).collect();
+                    let t_y: Vec<f64> = validation_results.iter().map(|r| r.3).collect();
+                    let p_xr = p_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - p_x.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let p_yr = p_y.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - p_y.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let t_xr = t_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - t_x.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let t_yr = t_y.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - t_y.iter().cloned().fold(f64::INFINITY, f64::min);
+                    println!("  Coverage X: {:.0}/{:.0} px ({:.0}%)", p_xr, t_xr, 100.0 * p_xr / t_xr.max(1.0));
+                    println!("  Coverage Y: {:.0}/{:.0} px ({:.0}%)", p_yr, t_yr, 100.0 * p_yr / t_yr.max(1.0));
                     println!("  Press C to recalibrate, ESC to quit.");
                 }
 
-                // Save session for offline replay/benchmarking (once per session)
                 if !saved_session {
                     let path = "saccade_session.bin";
                     match session.save(path) {
@@ -461,6 +474,16 @@ fn main() {
 
         // --- Running phase: predict gaze and show cursor ---
         if calib.phase() == Phase::Running {
+            // Continuous learning: every click adds a training sample at click coords
+            // (assumes user looks where they click — WebGazer's key insight)
+            if mouse_edge {
+                if let Some(feats) = &current_features {
+                    ridge_reg.add_sample(feats.clone(), mouse_pos.0 as f32, mouse_pos.1 as f32);
+                    println!("  +1 click sample at ({:.0}, {:.0}), total: {}",
+                        mouse_pos.0, mouse_pos.1, ridge_reg.sample_count());
+                }
+            }
+
             if let Some(feats) = &current_features {
                 if let Some((raw_x, raw_y)) = ridge_reg.predict(feats) {
                     let clamped_x = (raw_x as f64).clamp(0.0, sw as f64 - 1.0);
@@ -487,18 +510,6 @@ fn main() {
                 }
             }
 
-            // Show validation results in corner
-            if validation_error_px > 0.0 {
-                let bar_y = 50;
-                let bar_x = 20;
-                // Draw a small status bar showing accuracy
-                let err_color = if validation_error_px < 100.0 { 0x00FF00 }
-                                else if validation_error_px < 200.0 { 0xFFFF00 }
-                                else { 0xFF0000 };
-                for y in 0..30 { for x in 0..200 { if bar_y+y < sh && bar_x+x < sw { buf[(bar_y+y)*sw+bar_x+x] = 0x222222; }}}
-                let bar_fill = (200.0 - validation_error_px.min(200.0)) as usize;
-                for y in 0..30 { for x in 0..bar_fill { if bar_y+y < sh && bar_x+x < sw { buf[(bar_y+y)*sw+bar_x+x] = err_color; }}}
-            }
         }
 
         // FPS / status bar

@@ -19,10 +19,12 @@ pub struct CalibFrame {
     pub target_y: f32,
 }
 
-/// One validation sample: features only (target is constant for the session).
+/// One validation sample: features + the target the user was looking at.
 #[derive(Debug, Clone)]
 pub struct ValidFrame {
     pub features: Vec<f32>,
+    pub target_x: f32,
+    pub target_y: f32,
 }
 
 /// Recorded session.
@@ -63,6 +65,8 @@ impl Session {
         write_u32(&mut w, self.validation.len() as u32)?;
         for v in &self.validation {
             write_features(&mut w, &v.features)?;
+            write_f32(&mut w, v.target_x)?;
+            write_f32(&mut w, v.target_y)?;
         }
         Ok(())
     }
@@ -94,7 +98,9 @@ impl Session {
         let mut validation = Vec::with_capacity(n_valid);
         for _ in 0..n_valid {
             let features = read_features(&mut r)?;
-            validation.push(ValidFrame { features });
+            let target_x = read_f32(&mut r)?;
+            let target_y = read_f32(&mut r)?;
+            validation.push(ValidFrame { features, target_x, target_y });
         }
         Ok(Self {
             screen_w,
@@ -156,7 +162,11 @@ mod tests {
             target_x: 300.0,
             target_y: 400.0,
         });
-        s.validation.push(ValidFrame { features: vec![7.0, 8.0, 9.0] });
+        s.validation.push(ValidFrame {
+            features: vec![7.0, 8.0, 9.0],
+            target_x: 500.0,
+            target_y: 600.0,
+        });
 
         let path = std::env::temp_dir().join("saccade_test_session.bin");
         s.save(&path).unwrap();
@@ -170,6 +180,8 @@ mod tests {
         assert_eq!(loaded.calibration[1].target_x, 300.0);
         assert_eq!(loaded.validation.len(), 1);
         assert_eq!(loaded.validation[0].features, vec![7.0, 8.0, 9.0]);
+        assert_eq!(loaded.validation[0].target_x, 500.0);
+        assert_eq!(loaded.validation[0].target_y, 600.0);
 
         let _ = std::fs::remove_file(&path);
     }

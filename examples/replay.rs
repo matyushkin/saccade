@@ -159,7 +159,11 @@ fn bench_pca(session: &Session, k: usize) -> (f64, f64, f64) {
             v.features.iter().enumerate().map(|(j, &f)| f as f64 - mean_row[j]));
         let proj = pca_basis.transpose() * centered;
         let feats: Vec<f32> = proj.iter().map(|&v| v as f32).collect();
-        sess2.validation.push(saccade::session::ValidFrame { features: feats });
+        sess2.validation.push(saccade::session::ValidFrame {
+            features: feats,
+            target_x: v.target_x,
+            target_y: v.target_y,
+        });
     }
 
     let r = bench_ridge(&sess2, 1e-5, k_use);
@@ -214,13 +218,12 @@ fn bench_outlier_rejection(session: &Session, k_sigma: f64) {
         }
     }
 
-    let target = session.validation_target;
     let mut errors = Vec::new();
     let mut preds = Vec::new();
     for v in &session.validation {
         if let Some((px, py)) = reg2.predict(&v.features) {
-            let dx = px as f64 - target.0 as f64;
-            let dy = py as f64 - target.1 as f64;
+            let dx = px as f64 - v.target_x as f64;
+            let dy = py as f64 - v.target_y as f64;
             errors.push((dx*dx + dy*dy).sqrt());
             preds.push((px as f64, py as f64));
         }
@@ -274,13 +277,12 @@ fn bench_ridge_subset(session: &Session, lambda: f64, feat_len: usize, take: usi
         reg.add_sample(c.features.clone(), c.target_x, c.target_y);
     }
 
-    let target = session.validation_target;
     let mut errors: Vec<f64> = Vec::new();
     let mut predictions: Vec<(f64, f64)> = Vec::new();
     for v in &session.validation {
         if let Some((px, py)) = reg.predict(&v.features) {
-            let dx = px as f64 - target.0 as f64;
-            let dy = py as f64 - target.1 as f64;
+            let dx = px as f64 - v.target_x as f64;
+            let dy = py as f64 - v.target_y as f64;
             errors.push((dx * dx + dy * dy).sqrt());
             predictions.push((px as f64, py as f64));
         }
@@ -310,7 +312,6 @@ fn bench_smoothed(session: &Session, lambda: f64, feat_len: usize, label: &str, 
         reg.add_sample(c.features.clone(), c.target_x, c.target_y);
     }
 
-    let target = session.validation_target;
     let mut buffer: Vec<(f64, f64)> = Vec::new();
     let mut errors = Vec::new();
     let mut smoothed_predictions: Vec<(f64, f64)> = Vec::new();
@@ -328,8 +329,8 @@ fn bench_smoothed(session: &Session, lambda: f64, feat_len: usize, label: &str, 
                 let my = buffer.iter().map(|p| p.1).sum::<f64>() / n;
                 (mx, my)
             };
-            let dx = smoothed.0 - target.0 as f64;
-            let dy = smoothed.1 - target.1 as f64;
+            let dx = smoothed.0 - v.target_x as f64;
+            let dy = smoothed.1 - v.target_y as f64;
             errors.push((dx * dx + dy * dy).sqrt());
             smoothed_predictions.push(smoothed);
         }
