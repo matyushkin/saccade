@@ -266,6 +266,10 @@ fn main() {
     let mut frame_n = 0u64;
     let mut last_gaze: Option<(f32, f32)> = None; // cached CNN output
 
+    // Debug: save first N normalized crops to disk for visual inspection
+    let mut debug_saves_remaining = 10u32;
+    let _ = std::fs::create_dir_all("debug_crops");
+
     let pip_w = 240usize;
     let pip_h = pip_w * ch / cw;
     let start = Instant::now();
@@ -321,7 +325,7 @@ fn main() {
         } else { Vec::new() };
         let detected = faces.iter().max_by_key(|f| { let b=f.bbox(); b.width()*b.height() });
 
-        for px in buf.iter_mut() { *px = 0; }
+        for px in buf.iter_mut() { *px = 0xFFFFFF; }
 
         // PIP preview
         let pip_x = sw - pip_w - 10;
@@ -383,6 +387,41 @@ fn main() {
                             600.0,   // virtual distance: 600 mm
                             1600.0,  // virtual focal length
                         );
+
+                        // DEBUG: save first N normalized crops + raw face crop for comparison
+                        if debug_saves_remaining > 0 {
+                            let idx = 10 - debug_saves_remaining;
+                            // Save normalized crop
+                            if let Some(img) = image::RgbImage::from_raw(448, 448, normalized.clone()) {
+                                let _ = img.save(format!("debug_crops/normalized_{idx:02}.png"));
+                            }
+                            // Save raw face crop for comparison
+                            let crop_w = fwf;
+                            let crop_h = fhf;
+                            let mut raw_crop = vec![0u8; crop_w * crop_h * 3];
+                            for y in 0..crop_h {
+                                for x in 0..crop_w {
+                                    if fx + x < cw && fy + y < ch {
+                                        let si = ((fy + y) * cw + (fx + x)) * 3;
+                                        let di = (y * crop_w + x) * 3;
+                                        raw_crop[di] = rgb[si];
+                                        raw_crop[di+1] = rgb[si+1];
+                                        raw_crop[di+2] = rgb[si+2];
+                                    }
+                                }
+                            }
+                            if let Some(img) = image::RgbImage::from_raw(crop_w as u32, crop_h as u32, raw_crop) {
+                                let _ = img.save(format!("debug_crops/raw_face_{idx:02}.png"));
+                            }
+                            // Also dump diagnostic info
+                            println!("[DEBUG] Save {idx:02}: face=({fx},{fy},{fwf},{fhf}) eye_3d=({:.1},{:.1},{:.1}) tz={:.1}",
+                                eye_center_3d.x, eye_center_3d.y, eye_center_3d.z, translation.z);
+                            debug_saves_remaining -= 1;
+                            if debug_saves_remaining == 0 {
+                                println!("[DEBUG] Finished saving 10 crops to debug_crops/");
+                            }
+                        }
+
                         if let Some((yaw_n, pitch_n)) = run_gaze_from_buffer(&gaze_net, &normalized, 448, 448) {
                             // Denormalize back to real camera frame
                             let r_norm = build_normalization_rotation(&rotation, &eye_center_3d);
@@ -410,14 +449,15 @@ fn main() {
             let samples_at = calib.samples_at_current();
             let (tx, ty) = targets[calib_idx];
 
+            // White background — dark color saturates with clicks
             let progress = samples_at as f32 / SAMPLES_PER_POINT as f32;
-            let red = (180.0 + 75.0 * progress) as u32;
-            let green = (140.0 * (1.0 - progress)) as u32;
-            let blue = (140.0 * (1.0 - progress)) as u32;
+            let red = (255.0 - 100.0 * progress) as u32;
+            let green = (150.0 * (1.0 - progress)) as u32;
+            let blue = (150.0 * (1.0 - progress)) as u32;
             let color = (red << 16) | (green << 8) | blue;
             let r = 22 + (progress * 8.0) as usize;
             draw_filled_circle(&mut buf, sw, sh, tx as usize, ty as usize, r, color);
-            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 3, 0xFFFFFF);
+            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 3, 0x000000);
 
             let click_dist = ((mouse_pos.0 as f64 - tx).powi(2) + (mouse_pos.1 as f64 - ty).powi(2)).sqrt();
             if mouse_edge && click_dist < 80.0 {
@@ -457,12 +497,12 @@ fn main() {
         // Validation phase
         if calib.phase() == Phase::Validating && validation_idx < validation_targets.len() {
             let (vtx, vty) = validation_targets[validation_idx];
-            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 24, 0x00AAFF);
-            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 30, 0xFFFFFF);
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 24, 0x0066CC);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 30, 0x000000);
             for (i, &(px, py)) in validation_targets.iter().enumerate() {
-                let c = if i < validation_idx { 0x00FF00 }
-                        else if i == validation_idx { 0x00AAFF }
-                        else { 0x333333 };
+                let c = if i < validation_idx { 0x009900 }
+                        else if i == validation_idx { 0x0066CC }
+                        else { 0xAAAAAA };
                 draw_filled_circle(&mut buf, sw, sh, px as usize, py as usize, 6, c);
             }
 

@@ -223,7 +223,7 @@ fn main() {
         let best = faces.iter().max_by_key(|f| { let b=f.bbox(); b.width()*b.height() });
 
         // Clear screen
-        for px in buf.iter_mut() { *px = 0; }
+        for px in buf.iter_mut() { *px = 0xFFFFFF; }
 
         // PIP preview (top-right)
         let pip_x = sw - pip_w - 10;
@@ -338,19 +338,17 @@ fn main() {
             let samples_at_current_point = calib.samples_at_current();
             let (tx, ty) = targets[calib_idx];
 
-            // Color saturates from light pink → bright red as user clicks more
-            // 0 clicks: light gray-pink, 5 clicks: bright pure red
+            // On WHITE background: target darkens with clicks (light red → dark red)
             let progress = samples_at_current_point as f32 / SAMPLES_PER_POINT as f32;
-            let red = (180.0 + 75.0 * progress) as u32;
-            let green = (140.0 * (1.0 - progress)) as u32;
-            let blue = (140.0 * (1.0 - progress)) as u32;
+            let red = (255.0 - 100.0 * progress) as u32;
+            let green = (150.0 * (1.0 - progress)) as u32;
+            let blue = (150.0 * (1.0 - progress)) as u32;
             let target_color = (red << 16) | (green << 8) | blue;
 
-            // Bigger size as progress grows too
             let r = 22 + (progress * 8.0) as usize;
             draw_filled_circle(&mut buf, sw, sh, tx as usize, ty as usize, r, target_color);
-            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 3, 0xFFFFFF);
-            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 4, 0xFFFFFF);
+            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 3, 0x000000);
+            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 4, 0x000000);
 
             // Capture on mouse click anywhere on/near the target dot
             // (large hit radius — user just needs to click the area while looking at it)
@@ -421,17 +419,17 @@ fn main() {
         if calib.phase() == Phase::Validating && validation_idx < validation_targets.len() {
             let (vtx, vty) = validation_targets[validation_idx];
 
-            // Draw target — distinct from calibration (blue ring)
-            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 24, 0x00AAFF);
-            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 30, 0xFFFFFF);
-            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 31, 0xFFFFFF);
-            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 4, 0xFFFFFF);
+            // Draw target on white bg — dark blue dot with black ring
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 24, 0x0066CC);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 30, 0x000000);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 31, 0x000000);
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 4, 0x000000);
 
-            // Show progress dots for validation
+            // Progress dots for all validation positions
             for (i, &(px, py)) in validation_targets.iter().enumerate() {
-                let c = if i < validation_idx { 0x00FF00 }
-                        else if i == validation_idx { 0x00AAFF }
-                        else { 0x333333 };
+                let c = if i < validation_idx { 0x009900 }
+                        else if i == validation_idx { 0x0066CC }
+                        else { 0xAAAAAA };
                 draw_filled_circle(&mut buf, sw, sh, px as usize, py as usize, 6, c);
             }
 
