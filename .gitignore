@@ -3,3 +3,4 @@
 *.onnx
 saccade_session.bin
 synthetic_detected.png
+/debug_crops
