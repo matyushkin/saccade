@@ -23,8 +23,15 @@ required-features = ["demo"]
 name = "diag"
 required-features = ["demo"]
 
+[[example]]
+name = "webgazer"
+required-features = ["demo"]
+
+[[example]]
+name = "replay"
+
 [features]
-demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image", "dep:tract-onnx"]
+demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image", "dep:tract-onnx", "dep:display-info"]
 
 [dependencies.nokhwa]
 version = "0.10"
@@ -45,4 +52,8 @@ optional = true
 
 [dependencies.tract-onnx]
 version = "0.21"
+optional = true
+
+[dependencies.display-info]
+version = "0.5"
 optional = true

@@ -56,6 +56,49 @@ pub fn head_roll(left_pupil: (f64, f64), right_pupil: (f64, f64)) -> f64 {
     dy.atan2(dx)
 }
 
+/// PPERV (Pupil Position in Eye Reference Vector) — head-pose-invariant feature.
+///
+/// Computes pupil position relative to eye corners, normalized by eye width
+/// and de-rotated to the eye's local coordinate frame. This is more stable
+/// than ROI-bounding-box normalization because eye corners are well-defined
+/// landmarks that don't move when the eye rotates.
+///
+/// - `pupil`: detected pupil center (absolute image pixels)
+/// - `outer_corner`, `inner_corner`: eye corner landmarks (absolute pixels)
+pub fn pperv(
+    pupil: (f64, f64),
+    outer_corner: (f64, f64),
+    inner_corner: (f64, f64),
+) -> NormalizedPupil {
+    let cx = (outer_corner.0 + inner_corner.0) / 2.0;
+    let cy = (outer_corner.1 + inner_corner.1) / 2.0;
+    let dx = inner_corner.0 - outer_corner.0;
+    let dy = inner_corner.1 - outer_corner.1;
+    let eye_width = (dx * dx + dy * dy).sqrt();
+    if eye_width < 1.0 {
+        return NormalizedPupil { x: 0.0, y: 0.0 };
+    }
+
+    // Eye axis angle (from outer to inner corner)
+    let angle = dy.atan2(dx);
+    let cos = angle.cos();
+    let sin = angle.sin();
+
+    // Translate pupil to eye center
+    let rel_x = pupil.0 - cx;
+    let rel_y = pupil.1 - cy;
+
+    // Rotate into eye's local frame (x = along eye axis, y = perpendicular)
+    let local_x = rel_x * cos + rel_y * sin;
+    let local_y = -rel_x * sin + rel_y * cos;
+
+    // Normalize by eye width (not 0.5 × width, so output is in [-0.5, 0.5] for extremes)
+    NormalizedPupil {
+        x: (local_x / eye_width).clamp(-1.5, 1.5),
+        y: (local_y / eye_width).clamp(-1.5, 1.5),
+    }
+}
+
 /// A single calibration sample: normalized pupil → screen point.
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationSample {
@@ -298,6 +341,41 @@ mod tests {
         let p = normalize_pupil((rpx, rpy), (100.0, 50.0), (80.0, 80.0), roll);
         assert!((p.x - 1.0).abs() < 0.1, "x={}", p.x);
         assert!(p.y.abs() < 0.1, "y={}", p.y);
+    }
+
+    #[test]
+    fn pperv_pupil_at_center() {
+        // Eye corners at (100, 50) and (140, 50), pupil at center (120, 50)
+        let p = pperv((120.0, 50.0), (100.0, 50.0), (140.0, 50.0));
+        assert!(p.x.abs() < 0.01, "x={}", p.x);
+        assert!(p.y.abs() < 0.01, "y={}", p.y);
+    }
+
+    #[test]
+    fn pperv_pupil_right_of_center() {
+        // Pupil moved 10px right (25% of eye width)
+        let p = pperv((130.0, 50.0), (100.0, 50.0), (140.0, 50.0));
+        assert!((p.x - 0.25).abs() < 0.01, "x={}", p.x);
+    }
+
+    #[test]
+    fn pperv_rotation_invariant() {
+        // Same gaze (pupil at center), different head rotations
+        let p1 = pperv((120.0, 50.0), (100.0, 50.0), (140.0, 50.0));
+        // Rotate 45° — pupil and corners rotate together
+        let cx = 120.0; let cy = 50.0;
+        let rot = |x: f64, y: f64, ang: f64| {
+            let dx = x - cx; let dy = y - cy;
+            (cx + dx * ang.cos() - dy * ang.sin(), cy + dx * ang.sin() + dy * ang.cos())
+        };
+        let ang = std::f64::consts::PI / 4.0;
+        let pupil_r = rot(120.0, 50.0, ang);
+        let c1_r = rot(100.0, 50.0, ang);
+        let c2_r = rot(140.0, 50.0, ang);
+        let p2 = pperv(pupil_r, c1_r, c2_r);
+        // Should give the same normalized coordinates
+        assert!((p1.x - p2.x).abs() < 0.01);
+        assert!((p1.y - p2.y).abs() < 0.01);
     }
 
     #[test]
