@@ -630,6 +630,49 @@ fn main() {
                                     println!("\nGrid calibration done ({} rounds): {} samples. Auto λ={best_lam:.0e} (LOO err: {loo_err:.0} px)",
                                         GRID_ROUNDS, ridge_reg.sample_count());
                                 }
+                                // Post-calibration residual filtering: remove samples where the model's
+                                // training error is an outlier (mean + 2σ). Removes blinked/saccadic clicks.
+                                {
+                                    let _init_lam = ridge_reg.lambda;
+                                    if ridge_reg.sample_count() >= 6 {
+                                        let mut residuals: Vec<f64> = Vec::new();
+                                        let all_feats: Vec<Vec<f32>> = ridge_reg.samples.iter().map(|s| s.features.clone()).collect();
+                                        let all_tx: Vec<f32> = ridge_reg.samples.iter().map(|s| s.target_x).collect();
+                                        let all_ty: Vec<f32> = ridge_reg.samples.iter().map(|s| s.target_y).collect();
+                                        for (i, feats) in all_feats.iter().enumerate() {
+                                            if let Some((px, py)) = ridge_reg.predict(feats) {
+                                                let dx = px as f64 - all_tx[i] as f64;
+                                                let dy = py as f64 - all_ty[i] as f64;
+                                                residuals.push((dx*dx + dy*dy).sqrt());
+                                            } else {
+                                                residuals.push(0.0);
+                                            }
+                                        }
+                                        let mean_r: f64 = residuals.iter().sum::<f64>() / residuals.len() as f64;
+                                        let var_r: f64 = residuals.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / residuals.len() as f64;
+                                        let std_r = var_r.sqrt();
+                                        let threshold = mean_r + 2.0 * std_r;
+                                        let before = ridge_reg.sample_count();
+                                        let good: Vec<RidgeSample> = ridge_reg.samples.iter().zip(residuals.iter())
+                                            .filter(|(_, &r)| r <= threshold)
+                                            .map(|(s, _)| s.clone())
+                                            .collect();
+                                        let removed = before - good.len();
+                                        ridge_reg.clear();
+                                        for s in good {
+                                            ridge_reg.add_sample(s.features, s.target_x, s.target_y);
+                                        }
+                                        if removed > 0 {
+                                            println!("Residual filtering: removed {removed} outlier samples (threshold {threshold:.0} px).");
+                                            // Re-tune lambda on cleaned data
+                                            let candidates2 = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+                                            if let Some(best_lam) = ridge_reg.auto_lambda(&candidates2) {
+                                                ridge_reg.set_lambda(best_lam);
+                                                println!("Re-tuned λ={best_lam:.0e} after filtering.");
+                                            }
+                                        }
+                                    }
+                                }
                                 println!("Now click each blue dot for validation.");
                                 validation_idx = 0;
                                 validation_results.clear();
