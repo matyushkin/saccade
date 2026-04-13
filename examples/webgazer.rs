@@ -28,6 +28,13 @@ const HEAD_POSE_FEAT_LEN: usize = 6;
 const TOTAL_FEAT_LEN: usize = BOTH_EYES_FEAT_LEN + HEAD_POSE_FEAT_LEN; // 126
 const EAR_BLINK_THRESHOLD: f32 = 0.15;
 const CALIB_SAVE_PATH: &str = "saccade_calib.bin";
+
+/// MacBook webcam is ~95 mm above screen center.
+/// At 50 cm viewing distance this creates ~10.8° vertical parallax.
+/// The 5×5 calibration grid absorbs the mean offset; the non-linearity
+/// (angle varies across screen height) remains as a sub-5px residual.
+/// A full geometric correction would require known viewing distance.
+const MACBOOK_CAM_OFFSET_MM: f64 = 95.0;
 use saccade::session::{CalibFrame, Session, ValidFrame};
 use std::time::Instant;
 use tract_onnx::prelude::*;
