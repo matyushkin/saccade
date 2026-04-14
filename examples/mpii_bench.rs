@@ -40,13 +40,7 @@
 //! Reports mean ± std over all test frames, per subject and overall.
 
 use image::ImageReader;
-use saccade::ridge::{self, RidgeRegressor, BOTH_EYES_FEAT_LEN};
-
-/// Number of frames per subject used for calibration.
-const N_CALIB: usize = 200;
-
-/// Feature vector length: two eyes (120-D) + 3 head-pose proxy features.
-const FEAT_LEN: usize = BOTH_EYES_FEAT_LEN + 3;
+use saccade::ridge::{self, RidgeRegressor};
 
 /// Lambda candidates for auto-tuning.
 const LAMBDA_CANDIDATES: &[f64] = &[1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
@@ -64,13 +58,34 @@ struct Sample {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    let proc_root = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "MPIIGaze_proc".to_string());
+    // Parse args: [proc_root] [--patch WxH] [--n-calib N]
+    let mut proc_root = "MPIIGaze_proc".to_string();
+    let mut patch_w: usize = 20;
+    let mut patch_h: usize = 12;
+    let mut n_calib: usize = 200;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--patch" => {
+                let v = args.next().expect("--patch WxH");
+                let parts: Vec<&str> = v.split('x').collect();
+                patch_w = parts[0].parse().expect("patch W");
+                patch_h = parts[1].parse().expect("patch H");
+            }
+            "--n-calib" => {
+                n_calib = args.next().expect("--n-calib N").parse().expect("N");
+            }
+            s if !s.starts_with('-') => proc_root = s.to_string(),
+            _ => eprintln!("unknown arg: {arg}"),
+        }
+    }
+
+    let feat_len = patch_w * patch_h * 2 + 3; // two eyes + 3 head pose
 
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
-    println!("Protocol: first {N_CALIB} frames/subject = calibration, rest = test");
-    println!("Features: {FEAT_LEN}-D (CLAHE eye patches + 3 head-pose)");
+    println!("Protocol: first {n_calib} frames/subject = calibration, rest = test");
+    println!("Features: {feat_len}-D (CLAHE {patch_w}×{patch_h} eye patches + 3 head-pose)");
     println!();
 
     let mut all_errors: Vec<f64> = Vec::new();
@@ -90,8 +105,8 @@ fn main() {
             Err(e) => { eprintln!("  skip {subject}: {e}"); continue; }
         };
 
-        if samples.len() < N_CALIB + 10 {
-            eprintln!("  skip {subject}: only {} samples (need >{})", samples.len(), N_CALIB + 10);
+        if samples.len() < n_calib + 10 {
+            eprintln!("  skip {subject}: only {} samples (need >{})", samples.len(), n_calib + 10);
             continue;
         }
 
@@ -99,16 +114,16 @@ fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let extracted: Vec<Option<(Vec<f32>, f64, f64)>> = samples.iter()
-            .map(extract_features)
+            .map(|s| extract_features(s, patch_w, patch_h))
             .collect();
 
-        let calib_count = extracted.iter().take(N_CALIB)
+        let calib_count = extracted.iter().take(n_calib)
             .filter(|e| e.is_some()).count();
 
-        let mut reg = RidgeRegressor::new(N_CALIB + 10, 1e4, FEAT_LEN);
+        let mut reg = RidgeRegressor::new(n_calib + 10, 1e4, feat_len);
 
         // Calibration phase
-        for entry in extracted.iter().take(N_CALIB).flatten() {
+        for entry in extracted.iter().take(n_calib).flatten() {
             let (feats, yaw, pitch) = entry;
             // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
             reg.add_sample(feats.clone(), (*yaw * 1000.0) as f32, (*pitch * 1000.0) as f32);
@@ -119,11 +134,16 @@ fn main() {
             reg.set_lambda(best_lam);
         }
 
+        // Solve once — reuse coefficients for all test predictions (O(p) each vs O(n·p²))
+        let Some((beta_x, beta_y)) = reg.solve() else {
+            println!(" solve failed"); continue;
+        };
+
         // Test phase
         let mut subject_errors: Vec<f64> = Vec::new();
-        for entry in extracted.iter().skip(N_CALIB).flatten() {
+        for entry in extracted.iter().skip(n_calib).flatten() {
             let (feats, true_yaw, true_pitch) = entry;
-            let Some((py_scaled, pp_scaled)) = reg.predict(feats) else { continue };
+            let (py_scaled, pp_scaled) = RidgeRegressor::predict_from_coeffs(feats, &beta_x, &beta_y);
 
             let pred_yaw   = py_scaled as f64 / 1000.0;
             let pred_pitch = pp_scaled as f64 / 1000.0;
@@ -227,7 +247,7 @@ fn parse_labels(label_path: &str, subject_dir: &str) -> Result<Vec<Sample>, Stri
 // ─── Feature extraction ──────────────────────────────────────────────────────
 
 /// Extract features from one sample. Returns (features, yaw_rad, pitch_rad) or None.
-fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
+fn extract_features(s: &Sample, patch_w: usize, patch_h: usize) -> Option<(Vec<f32>, f64, f64)> {
     let load_gray = |path: &str| -> Option<(Vec<u8>, usize, usize)> {
         let img = ImageReader::open(path).ok()?.decode().ok()?.into_luma8();
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -238,8 +258,8 @@ fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
     let (right_gray, rw, rh) = load_gray(&s.right_path)?;
 
     // Patches are single-channel (grayscale PNG from preprocessor)
-    let l_feat = ridge::extract_eye_features_gray(&left_gray,  lw, lh);
-    let r_feat = ridge::extract_eye_features_gray(&right_gray, rw, rh);
+    let l_feat = ridge::extract_eye_features_gray_sized(&left_gray,  lw, lh, patch_w, patch_h);
+    let r_feat = ridge::extract_eye_features_gray_sized(&right_gray, rw, rh, patch_w, patch_h);
 
     // Convert 3-D unit gaze vector → yaw/pitch angles.
     // MPIIGaze convention: x=right, y=down, z=toward camera.
@@ -251,7 +271,8 @@ fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
     let yaw   = (-gx / norm).atan2(-gz / norm);
     let pitch = ((-gy) / norm).asin();
 
-    let mut feats = Vec::with_capacity(FEAT_LEN);
+    let feat_len = patch_w * patch_h * 2 + 3;
+    let mut feats = Vec::with_capacity(feat_len);
     feats.extend_from_slice(&l_feat);
     feats.extend_from_slice(&r_feat);
     feats.push(s.head[0]);

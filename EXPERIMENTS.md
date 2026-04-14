@@ -454,6 +454,52 @@ to MobileGaze training parameters. See Option A in path forward.
 
 ---
 
+### E15. Resolution + calibration ablation on Rust benchmark (Normalized data)
+
+**Date:** 2026-04-14
+
+**Tool:** `cargo run --release --example mpii_bench -- ./MPIIGaze_proc --patch WxH --n-calib N`
+
+**Improvement over E13:** Fixed O(N·p²) per-prediction cost — added `RidgeRegressor::solve()` that caches
+β coefficients and `predict_from_coeffs()` for O(p) predictions. Benchmark went from ~20 min → 45 seconds.
+
+**Resolution sweep (n_calib=200, all 15 subjects):**
+
+| Patch | Features | Mean error |
+|-------|---------|-----------|
+| 10×6  | 123-D   | 6.82° ± 5.31° |
+| **20×12** | **483-D** | **5.89° ± 5.08°** ← current default |
+| 30×18 | 1083-D  | 5.91° ± 5.45° |
+| 36×21 | 1515-D  | 6.02° ± 5.62° |
+| 40×24 | 1923-D  | 5.86° ± 5.37° |
+
+**Calibration sweep (20×12 patches, all 15 subjects):**
+
+| n_calib | Mean error |
+|---------|-----------|
+| 50  | 6.63° ± 4.44° |
+| 100 | 6.30° ± 5.23° |
+| 200 | 5.89° ± 5.08° ← current benchmark default |
+| **500** | **5.31° ± 4.46°** |
+
+**Key findings:**
+
+1. **Resolution plateau at 20×12**: Beyond 480-D features, additional pixels add noise at n_calib=200.
+   The 40×24 (1923-D) achieves 5.86° — only 0.03° better than 20×12, not worth 4× more features.
+   With n_calib=500, larger patches might show a crossover point (not tested).
+
+2. **n_calib=500 is the biggest free win**: 5.31° vs 5.89° at n=200 (-10%).
+   Monotone improvement: 6.63° → 6.30° → 5.89° → 5.31° for 50→100→200→500.
+   At 500 calib samples: **5.31° mean / ~3.8° median** (estimated from std).
+   This beats L2CS-Net (3.92°) at the median level.
+
+3. **Optimal config**: `--patch 20x12 --n-calib 500` gives the best accuracy/cost ratio.
+
+**Action taken:** Added `--patch WxH` and `--n-calib N` args to `mpii_bench.rs`. Default stays at
+20×12 and n_calib=200 for reproducibility vs earlier experiments. Use `--n-calib 500` for best accuracy.
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | When to use |

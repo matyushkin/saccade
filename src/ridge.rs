@@ -15,7 +15,9 @@
 use nalgebra::{DMatrix, DVector};
 
 /// Eye patch output resolution.
-/// Ablation on MPIIGaze (E14): 20×12 gives 10.35° vs 12.37° for 10×6 (-16%).
+/// E14 ablation (Original data): 20×12 → 10.35° vs 10×6 → 12.37° (-16%).
+/// E15 ablation (Normalized data): 20×12 → 5.89° ≈ 30×18 → 5.91° ≈ 40×24 → 5.86° (plateau).
+/// 20×12 optimal: best accuracy/feature ratio; larger patches offer negligible gain at n=200.
 pub const EYE_PATCH_W: usize = 20;
 pub const EYE_PATCH_H: usize = 12;
 pub const EYE_FEAT_LEN: usize = EYE_PATCH_W * EYE_PATCH_H; // 240 per eye
@@ -49,12 +51,25 @@ pub fn extract_eye_features(rgb: &[u8], width: usize, height: usize) -> Vec<f32>
 
 /// Extract features from a grayscale eye patch.
 pub fn extract_eye_features_gray(gray_patch: &[u8], width: usize, height: usize) -> Vec<f32> {
+    extract_eye_features_gray_sized(gray_patch, width, height, EYE_PATCH_W, EYE_PATCH_H)
+}
+
+/// Extract features from a grayscale eye patch, resizing to an arbitrary output size.
+/// Useful for resolution ablation (e.g., sweep 10×6 → 40×24).
+pub fn extract_eye_features_gray_sized(
+    gray_patch: &[u8],
+    width: usize,
+    height: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<f32> {
+    let out_len = out_w * out_h;
     if gray_patch.len() != width * height || width == 0 || height == 0 {
-        return vec![0.0; EYE_FEAT_LEN];
+        return vec![0.0; out_len];
     }
 
     let equalized = clahe_gray(gray_patch, width, height, 2, 2, 4.0);
-    bilinear_resize_gray_f32(&equalized, width, height, EYE_PATCH_W, EYE_PATCH_H)
+    bilinear_resize_gray_f32(&equalized, width, height, out_w, out_h)
 }
 
 /// CLAHE (Contrast Limited Adaptive Histogram Equalization) on a grayscale image.
@@ -363,6 +378,53 @@ impl RidgeRegressor {
     /// Override the lambda (e.g., after auto_lambda picks one).
     pub fn set_lambda(&mut self, lambda: f64) {
         self.lambda = lambda;
+    }
+
+    /// Solve ridge regression and return (beta_x, beta_y) coefficient vectors.
+    /// Use `predict_from_coeffs` for fast repeated predictions without re-solving.
+    pub fn solve(&self) -> Option<(Vec<f64>, Vec<f64>)> {
+        let n = self.samples.len();
+        if n < 3 { return None; }
+        let p = self.feat_len;
+        let weights = chronological_weights(n);
+
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_x = Vec::with_capacity(n);
+        let mut y_y = Vec::with_capacity(n);
+        for (i, s) in self.samples.iter().enumerate() {
+            let w = weights[i];
+            for &f in &s.features {
+                x_data.push(f as f64 * w);
+            }
+            y_x.push(s.target_x as f64 * w);
+            y_y.push(s.target_y as f64 * w);
+        }
+
+        let x_mat = DMatrix::from_row_slice(n, p, &x_data);
+        let xt = x_mat.transpose();
+        let mut xtx = &xt * &x_mat;
+        for i in 0..p { xtx[(i, i)] += self.lambda; }
+
+        let y_x_vec = DVector::from_vec(y_x);
+        let y_y_vec = DVector::from_vec(y_y);
+        let xty_x = &xt * &y_x_vec;
+        let xty_y = &xt * &y_y_vec;
+        let decomp = xtx.lu();
+        let beta_x = decomp.solve(&xty_x)?;
+        let beta_y = decomp.solve(&xty_y)?;
+
+        Some((beta_x.as_slice().to_vec(), beta_y.as_slice().to_vec()))
+    }
+
+    /// Predict using pre-solved coefficients (O(p) — much faster for batch prediction).
+    pub fn predict_from_coeffs(features: &[f32], beta_x: &[f64], beta_y: &[f64]) -> (f32, f32) {
+        let mut px = 0.0f64;
+        let mut py = 0.0f64;
+        for (i, &f) in features.iter().enumerate() {
+            px += f as f64 * beta_x[i];
+            py += f as f64 * beta_y[i];
+        }
+        (px as f32, py as f32)
     }
 
     /// Solve weighted ridge regression and predict for given features.
