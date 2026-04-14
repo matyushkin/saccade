@@ -4,3 +4,9 @@
 saccade_session.bin
 synthetic_detected.png
 /debug_crops
+
+# MPIIGaze dataset (too large for git)
+MPIIGaze/
+MPIIGaze.tar.gz
+MPIIGaze_proc/
+MPIIGaze_tmp/
