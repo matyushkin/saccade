@@ -625,6 +625,39 @@ each tile is 10×6 px ≈ pupil diameter — natural spatial scale for local nor
 
 ---
 
+### E19. Dead-end ablations — status: DONE (all neutral or worse)
+
+**Date:** 2026-04-15
+
+**Config:** 30×18 patches, 3×3 CLAHE tiles, n_calib=200, uniform-calib (best config from E18).
+
+| Variant | Mean error | Median | Notes |
+|---------|-----------|--------|-------|
+| No head pose features | 3.54° | — | Identical to baseline — head pose contributes negligibly |
+| Separate per-eye regressors (avg) | 3.64° | 2.80° | Worse — loses binocular correlations |
+| Per-feature z-score normalization | 10.52° | — | **Catastrophic** — near-constant pixels amplify noise when ÷ std≈0 |
+| Wide aspect ratio 40×12 | 3.61° | — | Worse — 30×18 (5:3) better than 10:3 |
+| Wider aspect 36×16 | 3.53° | 2.37° | Essentially same as 30×18 (3.54°) |
+| Fine lambda grid (15 values) | 3.54° | — | No improvement — 8-value grid is sufficient |
+
+**Conclusions:**
+
+- **Per-feature normalization**: fatal for pixel features. CLAHE already normalizes contrast;
+  dividing by per-pixel std amplifies variance from empty (eyelid/corner) regions.
+  Not retryable.
+
+- **Separate eye regressors**: loses cross-eye correlations (convergence/divergence encodes
+  gaze depth; conjugate eye movements encode horizontal gaze). Combined regressor is strictly
+  better.
+
+- **Wide aspect ratio**: the eye is wider than tall (≈5:3), and 30×18 (5:3) captures this.
+  Wider patches cut off iris vertically; taller patches add empty eyelid space.
+
+- **Head pose removal**: ridge regression with LOO CV lambda effectively zeros out uninformative
+  features. Head pose adds/removes ≈0 accuracy — ridge handles it.
+
+---
+
 ### E20. n_calib scaling curve — status: DONE (diminishing returns above n=1000)
 
 **Date:** 2026-04-15
