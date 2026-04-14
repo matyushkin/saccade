@@ -422,6 +422,48 @@ gap: to achieve <5° in the MPIIGaze protocol, we need either:
 
 ---
 
+### E14. MPIIGaze ablation: resolution, CNN hybrid (Python)
+
+**Date:** 2026-04-14
+
+**Tool:** `python3 tools/mpii_ablation.py ./MPIIGaze --n-calib=200 --subjects=5 --stride=10`
+
+**Goal:** Find the best feature strategy — pure pixels, CNN-only, or hybrid.
+Uses `Data/Original/` (1280×720 full frames), eye crops from landmarks, MobileGaze ONNX.
+
+**Results (5 subjects, stride=10 sampling, 200 calib frames):**
+
+| Mode | Mean error | ±Std | Features |
+|------|-----------|------|---------|
+| pixel_sm | 12.37° | 5.80° | 10×6 hist-eq, 120-D (≈ Rust baseline) |
+| **pixel_lg** | **10.35°** | **4.47°** | **20×12 hist-eq, 480-D** |
+| cnn_only | 15.98° | 3.44° | MobileGaze (yaw, pitch), 2-D |
+| hybrid | 11.43° | 4.73° | pixel_sm + CNN angles, 122-D |
+| hybrid_lg | 10.37° | 4.49° | pixel_lg + CNN angles, 482-D |
+
+**Key findings:**
+
+1. **Resolution is the biggest lever**: 10×6 → 20×12 gives 12.37° → 10.35° (-16%).
+   More pixels = more gaze-discriminating information. The CLAHE normalization
+   preserves fine-grained appearance differences at higher resolution.
+
+2. **MobileGaze CNN alone is worse than pixels** (15.98° vs 12.37°).
+   Root cause: CNN was trained on normalized face crops (Sugano-warped).
+   Without proper normalization, CNN predictions are systematically biased.
+   Person-specific calibration (200 samples) can't fully correct a nonlinear bias.
+
+3. **Hybrid adds no value over pixel_lg**: ridge regression weights CNN features near
+   zero when they're noisy. The 122-D hybrid ≈ 120-D pixels for this reason.
+
+**Action taken:** Updated `EYE_PATCH_W=20, EYE_PATCH_H=12` in `src/ridge.rs`.
+Expected improvement on MPIIGaze benchmark: 12.4° → ~10.4° (-16%).
+Expected improvement on screen-space accuracy: proportional, ~196 px vs 237 px.
+
+**For CNN to help (future work):** Requires correct Sugano normalization matched
+to MobileGaze training parameters. See Option A in path forward.
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | When to use |

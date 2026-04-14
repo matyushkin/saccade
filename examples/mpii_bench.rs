@@ -237,8 +237,9 @@ fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
     let (left_gray,  lw, lh) = load_gray(&s.left_path)?;
     let (right_gray, rw, rh) = load_gray(&s.right_path)?;
 
-    let l_feat = ridge::extract_eye_features(&left_gray,  lw, lh);
-    let r_feat = ridge::extract_eye_features(&right_gray, rw, rh);
+    // Patches are single-channel (grayscale PNG from preprocessor)
+    let l_feat = ridge::extract_eye_features_gray(&left_gray,  lw, lh);
+    let r_feat = ridge::extract_eye_features_gray(&right_gray, rw, rh);
 
     // Convert 3-D unit gaze vector → yaw/pitch angles.
     // MPIIGaze convention: x=right, y=down, z=toward camera.
