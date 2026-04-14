@@ -66,9 +66,12 @@ fn main() {
     let mut flip_right = false;
     let mut use_gradient = false;
     let mut uniform_calib = false;
-    let mut clahe_tx: usize = 2;
-    let mut clahe_ty: usize = 2;
+    let mut clahe_tx: usize = 3;
+    let mut clahe_ty: usize = 3;
     let mut clahe_clip: f32 = 4.0;
+    let mut normalize_feats = false;
+    let mut no_head_pose = false;
+    let mut separate_eyes = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -91,9 +94,12 @@ fn main() {
             "--clahe-clip" => {
                 clahe_clip = args.next().expect("--clahe-clip C").parse().expect("C");
             }
-            "--flip-right"    => flip_right = true,
-            "--gradient"      => use_gradient = true,
-            "--uniform-calib" => uniform_calib = true,
+            "--flip-right"         => flip_right = true,
+            "--gradient"           => use_gradient = true,
+            "--uniform-calib"      => uniform_calib = true,
+            "--normalize-features" => normalize_feats = true,
+            "--no-head-pose"       => no_head_pose = true,
+            "--separate-eyes"      => separate_eyes = true,
             s if !s.starts_with('-') => proc_root = s.to_string(),
             _ => eprintln!("unknown arg: {arg}"),
         }
@@ -101,7 +107,8 @@ fn main() {
 
     // Feature length: pixels per eye × 2 eyes (×2 if gradient appended) + 3 head pose
     let feat_per_eye = patch_w * patch_h * if use_gradient { 2 } else { 1 };
-    let feat_len = feat_per_eye * 2 + 3;
+    let head_feat_len = if no_head_pose { 0 } else { 3 };
+    let feat_len = feat_per_eye * 2 + head_feat_len;
 
     let feat_desc = if use_gradient { "CLAHE+SobelX" } else { "CLAHE" };
     let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
@@ -138,7 +145,7 @@ fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let extracted: Vec<Option<(Vec<f32>, f64, f64)>> = samples.iter()
-            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient, clahe_tx, clahe_ty, clahe_clip))
+            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient, clahe_tx, clahe_ty, clahe_clip, no_head_pose))
             .collect();
 
         // Select calibration indices (first N, or uniformly spread across session)
@@ -156,32 +163,99 @@ fn main() {
         let calib_count = calib_indices.iter()
             .filter(|&&i| extracted[i].is_some()).count();
 
+        // Optional per-feature z-score normalization (computed on calibration set only)
+        let (feat_mean, feat_std): (Vec<f32>, Vec<f32>) = if normalize_feats {
+            let calib_feats: Vec<&Vec<f32>> = calib_indices.iter()
+                .filter_map(|&i| extracted[i].as_ref().map(|(f, _, _)| f))
+                .collect();
+            let n = calib_feats.len();
+            if n < 2 {
+                (vec![0.0; feat_len], vec![1.0; feat_len])
+            } else {
+                let mut mean = vec![0.0f32; feat_len];
+                for f in &calib_feats { for (j, &v) in f.iter().enumerate() { mean[j] += v; } }
+                for m in &mut mean { *m /= n as f32; }
+                let mut var = vec![0.0f32; feat_len];
+                for f in &calib_feats { for (j, &v) in f.iter().enumerate() { var[j] += (v - mean[j]).powi(2); } }
+                let std: Vec<f32> = var.iter().map(|&v| (v / n as f32).sqrt().max(1e-6)).collect();
+                (mean, std)
+            }
+        } else {
+            (vec![0.0; feat_len], vec![1.0; feat_len])
+        };
+        let normalize = |feats: &[f32]| -> Vec<f32> {
+            if normalize_feats {
+                feats.iter().enumerate().map(|(j, &v)| (v - feat_mean[j]) / feat_std[j]).collect()
+            } else {
+                feats.to_vec()
+            }
+        };
+
+        let eye_feat_len = patch_w * patch_h;
+        // Per-eye feature length for separate-eyes mode; head pose split between eyes
+        let per_eye_feat = eye_feat_len + if no_head_pose { 0 } else { 1 }; // rough split
+
         let mut reg = RidgeRegressor::new(n_calib + 10, 1e4, feat_len);
+
+        // For separate-eyes: two regressors, one per eye
+        let mut reg_l = RidgeRegressor::new(n_calib + 10, 1e4, eye_feat_len);
+        let mut reg_r = RidgeRegressor::new(n_calib + 10, 1e4, eye_feat_len);
 
         // Calibration phase
         for &i in &calib_indices {
             if let Some((feats, yaw, pitch)) = &extracted[i] {
-                // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
-                reg.add_sample(feats.clone(), (*yaw * 1000.0) as f32, (*pitch * 1000.0) as f32);
+                let feats_n = normalize(feats);
+                let target_x = (*yaw * 1000.0) as f32;
+                let target_y = (*pitch * 1000.0) as f32;
+                if separate_eyes {
+                    // Left eye: first eye_feat_len features
+                    reg_l.add_sample(feats_n[..eye_feat_len].to_vec(), target_x, target_y);
+                    // Right eye: next eye_feat_len features
+                    reg_r.add_sample(feats_n[eye_feat_len..eye_feat_len*2].to_vec(), target_x, target_y);
+                } else {
+                    // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
+                    reg.add_sample(feats_n, target_x, target_y);
+                }
             }
         }
 
         // Auto-tune lambda via LOO CV
-        if let Some(best_lam) = reg.auto_lambda(LAMBDA_CANDIDATES) {
+        if separate_eyes {
+            if let Some(lam) = reg_l.auto_lambda(LAMBDA_CANDIDATES) { reg_l.set_lambda(lam); }
+            if let Some(lam) = reg_r.auto_lambda(LAMBDA_CANDIDATES) { reg_r.set_lambda(lam); }
+        } else if let Some(best_lam) = reg.auto_lambda(LAMBDA_CANDIDATES) {
             reg.set_lambda(best_lam);
         }
 
         // Solve once — reuse coefficients for all test predictions (O(p) each vs O(n·p²))
-        let Some((beta_x, beta_y)) = reg.solve() else {
-            println!(" solve failed"); continue;
-        };
+        let (beta_x, beta_y, beta_lx, beta_ly, beta_rx, beta_ry);
+        if separate_eyes {
+            let (lx, ly) = reg_l.solve().unwrap_or_else(|| (vec![0.0; eye_feat_len], vec![0.0; eye_feat_len]));
+            let (rx, ry) = reg_r.solve().unwrap_or_else(|| (vec![0.0; eye_feat_len], vec![0.0; eye_feat_len]));
+            beta_x = vec![]; beta_y = vec![];
+            beta_lx = lx; beta_ly = ly; beta_rx = rx; beta_ry = ry;
+        } else {
+            let Some((bx, by)) = reg.solve() else {
+                println!(" solve failed"); continue;
+            };
+            beta_x = bx; beta_y = by;
+            beta_lx = vec![]; beta_ly = vec![]; beta_rx = vec![]; beta_ry = vec![];
+        }
+        let _ = per_eye_feat;
 
         // Test phase: all frames NOT in calibration set
         let mut subject_errors: Vec<f64> = Vec::new();
         for (i, entry) in extracted.iter().enumerate() {
             if calib_set.contains(&i) { continue; }
             let Some((feats, true_yaw, true_pitch)) = entry else { continue };
-            let (py_scaled, pp_scaled) = RidgeRegressor::predict_from_coeffs(feats, &beta_x, &beta_y);
+            let feats_n = normalize(feats);
+            let (py_scaled, pp_scaled) = if separate_eyes {
+                let (lx, ly) = RidgeRegressor::predict_from_coeffs(&feats_n[..eye_feat_len], &beta_lx, &beta_ly);
+                let (rx, ry) = RidgeRegressor::predict_from_coeffs(&feats_n[eye_feat_len..eye_feat_len*2], &beta_rx, &beta_ry);
+                ((lx + rx) / 2.0, (ly + ry) / 2.0)
+            } else {
+                RidgeRegressor::predict_from_coeffs(&feats_n, &beta_x, &beta_y)
+            };
 
             let pred_yaw   = py_scaled as f64 / 1000.0;
             let pred_pitch = pp_scaled as f64 / 1000.0;
@@ -329,6 +403,7 @@ fn extract_features(
     clahe_tx: usize,
     clahe_ty: usize,
     clahe_clip: f32,
+    no_head_pose: bool,
 ) -> Option<(Vec<f32>, f64, f64)> {
     let load_gray = |path: &str| -> Option<(Vec<u8>, usize, usize)> {
         let img = ImageReader::open(path).ok()?.decode().ok()?.into_luma8();
@@ -368,13 +443,16 @@ fn extract_features(
     let yaw   = (-gx / norm).atan2(-gz / norm);
     let pitch = ((-gy) / norm).asin();
 
-    let feat_len = patch_w * patch_h * 2 + 3;
+    let head_feat_len = if no_head_pose { 0 } else { 3 };
+    let feat_len = patch_w * patch_h * 2 + head_feat_len;
     let mut feats = Vec::with_capacity(feat_len);
     feats.extend_from_slice(&l_feat);
     feats.extend_from_slice(&r_feat);
-    feats.push(s.head[0]);
-    feats.push(s.head[1]);
-    feats.push(s.head[2]);
+    if !no_head_pose {
+        feats.push(s.head[0]);
+        feats.push(s.head[1]);
+        feats.push(s.head[2]);
+    }
 
     Some((feats, yaw, pitch))
 }

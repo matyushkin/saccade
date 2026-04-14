@@ -29,6 +29,10 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 | Decay sample weights (E12) | Neutral on this dataset, not worth complexity | Only for sessions with strong temporal drift |
 | Horizontal flip of right eye (E16) | 6.12° vs 5.89° — worse; MPIIGaze normalized space is already consistent | — |
 | Sobel-x gradient features (E16) | 5.87° vs 5.89° at n=200 — negligible; no gain at n=500 | — |
+| Per-feature z-score normalization (E19) | 10.52° — catastrophic; near-constant pixels amplify noise when divided by tiny std | — |
+| Separate per-eye regressors + average (E19) | 3.64° vs 3.54° — worse; loses binocular correlations between eyes | — |
+| Head pose removal (E19) | 3.54° — neutral; head pose features contribute negligibly | — |
+| Wide aspect ratio patches 40×12 (E19) | 3.61° — worse; 30×18 (5:3 ratio) better | — |
 
 ## Promising next steps (ordered)
 
