@@ -1,0 +1,2361 @@
+%% Eye Tracking Algorithms: A Comprehensive Survey
+%% Written in the context of the Saccade project (github.com/leomaxx/saccade)
+%% Compile with: pdflatex eye_tracking_survey.tex (run twice for references)
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{lmodern}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{natbib}
+\usepackage{eurosym}
+
+\geometry{margin=2.5cm, top=3cm, bottom=3cm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black,
+  pdftitle={Eye Tracking Algorithms: A Comprehensive Survey},
+  pdfauthor={Saccade Project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\small Eye Tracking Survey}
+\lhead{\small Saccade Project}
+\cfoot{\thepage}
+
+\title{\textbf{Eye Tracking Algorithms: A Comprehensive Survey}\\[0.5em]
+\large From Pupil Detection to Gaze Estimation --- State of the Art and Practical Guide\\[0.5em]
+\normalsize \textit{Written in the context of the Saccade pure-Rust eye tracking library}}
+\author{Compiled for the Saccade Project\\
+\texttt{/Users/leo/Code/saccade}}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+This survey provides a comprehensive review of eye tracking algorithms, from low-level pupil detection to high-level gaze estimation and eye movement classification.
+We cover classical gradient-based and ellipse-fitting methods for pupil localization, modern appearance-based deep learning gaze estimators, geometric (model-based) approaches, head-pose normalization techniques, temporal filtering methods, and eye event classifiers.
+For each method we report typical accuracy (mean angular error in degrees), computational cost, and hardware requirements.
+We compile a comparative table of results across standard benchmarks (MPIIGaze, ETH-XGaze, GazeCapture), and provide a curated list of open-source repositories and datasets.
+The survey is motivated by the Saccade project~--- a pure-Rust webcam-based gaze estimation library.
+Under click-based within-session validation (the same protocol used by WebGazer.js) it achieves $142\,\text{px}$ ($\approx 2.2^\circ$) mean error on a $2056\times 1329$ display; under a stricter multi-point out-of-distribution protocol the honest figure is $\approx 237\,\text{px}$ ($3.7^\circ$).
+We discuss the methodological gap between these numbers and published SOTA results and propose concrete paths toward improvement.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Introduction}
+%% ============================================================
+
+Eye tracking~--- estimating the point of regard (PoR) of a person from sensor data~--- has applications spanning human-computer interaction, cognitive science, clinical assessment, autonomous driving, and AR/VR rendering optimization.
+Over the past decade the field has experienced a transition from specialist near-infrared (NIR) hardware (commercial systems such as Tobii or SR Research EyeLink achieving $0.3$--$0.5^\circ$ accuracy) toward commodity-camera solutions that run on standard RGB webcams or smartphone front cameras.
+
+Webcam-based gaze estimation brings unique challenges: uncontrolled illumination, large inter-session head-pose variation, low resolution eye images, and the absence of corneal reflections.
+These constraints have driven a shift from model-based geometric methods toward large-scale data-driven \textit{appearance-based} approaches.
+
+The Saccade project implements a suite of such algorithms in pure Rust, currently combining:
+\begin{itemize}
+  \item Pupil detection: Timm \& Barth~\cite{timm2011accurate} gradient method + PuRe~\cite{santini2018pure} edge-ellipse fitting.
+  \item Gaze mapping: Ridge regression over histogram-equalized eye patches (WebGazer-style~\cite{papoutsaki2016webgazer}).
+  \item Temporal smoothing: Kalman filter + 1\euro{} filter~\cite{casiez2012oef}.
+  \item Classification: I-VT saccade/fixation detector.
+\end{itemize}
+Under click-based within-session validation it records $142\,\text{px}$ mean error ($\approx 2.2^\circ$); under a stricter multi-point out-of-distribution protocol the figure is $237\,\text{px}$ ($3.7^\circ$)---see Section~\ref{sec:evaluation} for a discussion of these two metrics and their relation to published benchmarks.
+State-of-the-art deep learning methods achieve $3.5$--$3.9^\circ$ on MPIIGaze \textit{without any per-session calibration}, which is comparable to our calibrated result, suggesting significant headroom remains.
+
+This document is organized as follows.
+Section~\ref{sec:physiology} covers the human visual system and eye movement physiology~--- the biological substrate being measured.
+Section~\ref{sec:taxonomy} establishes a taxonomy.
+Sections~\ref{sec:pupil}--\ref{sec:event} cover each algorithmic layer.
+Section~\ref{sec:datasets} reviews public datasets.
+Section~\ref{sec:comparison} provides a comparative benchmark table.
+Section~\ref{sec:saccade} analyzes the Saccade project in context.
+Section~\ref{sec:recommendations} provides concrete recommendations.
+Section~\ref{sec:conclusion} concludes.
+
+%% ============================================================
+\section{The Human Visual System and Eye Movement Physiology}
+\label{sec:physiology}
+%% ============================================================
+
+Eye tracking algorithms measure physical properties of the eye as proxies for the underlying neural act of directing attention.
+Understanding the relevant anatomy, the repertoire of eye movements, and the psychophysics of human gaze is therefore a prerequisite for interpreting what any algorithm is computing, where its limits come from, and why particular design choices recur across methods.
+This section provides a concise reference for those limits.
+
+%% ------------------------------------------------------------
+\subsection{Anatomy of the Eye Relevant to Tracking}
+%% ------------------------------------------------------------
+
+\paragraph{Pupil.}
+The pupil is the aperture in the center of the iris that controls retinal illuminance.
+Its diameter varies continuously from approximately $2\,\text{mm}$ (bright outdoor light) to $8\,\text{mm}$ (dark-adapted) under the control of the sphincter and dilator pupillae muscles~\cite{winn1994factors}.
+Under \textit{visible} light the pupil appears dark because the intraocular media absorb most visible wavelengths, so little light is scattered back through the aperture; under \textit{near-infrared} (NIR, $780$--$900\,\text{nm}$) illumination this absorptance is lower and retinal reflectance is higher, causing the pupil to appear \textit{bright} (bright-pupil mode) when the illuminant is on-axis, or to remain dark (dark-pupil mode) when it is off-axis~\cite{duchowski2007eye}.
+Almost all dedicated IR eye trackers exploit the bright/dark pupil contrast reversal to make the pupil boundary highly salient.
+Standard RGB webcams provide no such contrast advantage, making pupil segmentation substantially harder.
+
+\paragraph{Iris.}
+The iris is the pigmented annular structure surrounding the pupil.
+It is approximately $11$--$12\,\text{mm}$ in diameter.
+For gaze estimation purposes the iris boundary (limbus) is generally more reliably detected than the pupil in visible-light images because the limbus creates a strong sclera-to-iris edge regardless of illumination.
+Several methods (ELG~\cite{park2018learning}, EllSeg~\cite{ellseg2021}) explicitly segment iris and pupil separately.
+The iris also provides a unique biometric texture, which is exploited in appearance-based methods~--- per-person iris texture differences are a leading cause of cross-person gaze estimation error and motivate per-user calibration.
+
+\paragraph{Cornea and specular glints.}
+The anterior corneal surface is a convex mirror with a radius of curvature of approximately $7.8\,\text{mm}$ (population range $7.2$--$8.4\,\text{mm}$)~\cite{atchison2000optics}.
+When a point light source illuminates the eye, it produces a \textit{specular reflection} (Purkinje image~I) on the corneal surface.
+Because the cornea is part of the rigid eyeball, the position of this glint on the camera sensor depends on both head orientation and eye rotation, but the \emph{vector from pupil center to glint} depends almost exclusively on eye rotation~--- the head-pose contribution largely cancels.
+This pupil-center/corneal-reflection (P-CR) vector is the basis of all model-based IR eye trackers (see Section~\ref{sec:geometric}).
+RGB webcam setups lack controlled illumination, so glints are either absent, inconsistent, or from uncontrolled ambient sources, which is the primary reason model-based methods require IR hardware.
+
+\paragraph{Fovea and gaze direction precision.}
+The fovea is the small central region of the retina where cone density is highest and visual acuity is maximal.
+Its anatomical extent is approximately $5^\circ$ of visual angle in diameter ($1.5\,\text{mm}$), but the region of peak acuity~--- the \textit{foveola}~--- subtends only about $1$--$2^\circ$~\cite{curcio1990human}.
+Because the visual system directs the fovea to the object of interest, the foveal axis defines the line of sight.
+This sets the precision requirement for eye tracking: detecting \textit{fixation targets} at the level of individual text characters requires accuracy of $0.5$--$1^\circ$; detecting fixations on coarser regions of interest requires $2$--$3^\circ$.
+
+\paragraph{Visual axis vs.\ optical axis: the kappa angle.}
+The \textit{optical axis} of the eye is the line connecting the center of the pupil with the centers of curvature of the cornea and lens.
+The \textit{visual axis} (line of sight) runs from the fovea through the nodal point to the fixation target.
+These two axes are not coincident: the visual axis is displaced nasally and slightly superiorly from the optical axis by an angle called \textit{angle kappa} (sometimes also called \textit{angle alpha}), which is defined in the pupillary plane as the angle between the pupillary axis and the line of sight.
+The population-mean value is approximately $5^\circ$ horizontal (nasal displacement), but individual values range from $2^\circ$ to $9^\circ$~\cite{basmak2007measurement,tabernero2019individual}.
+This inter-individual variation is critical: any algorithm that tracks the optical axis (pupil center, corneal reflection) but reports it as the line of sight incurs a systematic per-person error equal to kappa.
+Without per-person calibration, kappa sets a hard physiological floor on cross-person accuracy of roughly $3$--$5^\circ$.
+FAZE~\cite{park2019faze} explicitly identifies kappa offset as the dominant inter-person error term.
+
+%% ------------------------------------------------------------
+\subsection{Taxonomy of Eye Movements}
+%% ------------------------------------------------------------
+
+The eye executes a rich repertoire of movements, each driven by a distinct neural subsystem~\cite{leigh2015neurology}.
+Eye tracking algorithms must be designed to either exploit or robustly handle each type.
+
+\paragraph{Saccades.}
+Saccades are rapid, conjugate (both eyes move together) shifts of gaze from one fixation target to another.
+They are the dominant mechanism for redirecting the fovea.
+Key parameters~\cite{rayner1998eye}:
+\begin{itemize}
+  \item \textbf{Duration:} $20$--$200\,\text{ms}$, scaling approximately linearly with amplitude (${\sim}2.2\,\text{ms/deg}$).
+  \item \textbf{Peak velocity:} up to $700^\circ/\text{s}$ for large saccades; the \emph{main-sequence} relationship~\cite{bahill1975main} is: peak velocity $\approx 700 \cdot (1 - e^{-A/9.6})^\circ/\text{s}$ for amplitude $A$ in degrees, meaning small saccades ($1$--$2^\circ$) peak at $\approx100^\circ/\text{s}$ and large saccades ($30^\circ$) peak near $700^\circ/\text{s}$.
+  \item \textbf{Amplitude distribution:} natural viewing produces a heavy-tail distribution dominated by small saccades ($1$--$5^\circ$ in reading; $5$--$15^\circ$ in scene scanning); large saccades ($>30^\circ$) are rare~\cite{yarbus1967eye}.
+\end{itemize}
+The I-VT classifier (see Section~\ref{sec:event}) exploits the velocity gap between saccades (generally $>80$--$100^\circ/\text{s}$) and non-saccadic movements to segment gaze records.
+
+\paragraph{Fixations.}
+During a fixation the gaze dwells near a stationary target.
+Fixations are not truly static: they contain three classes of \textit{fixational eye movements}~\cite{martinez2004role}:
+\begin{itemize}
+  \item \textbf{Drift:} slow, irregular displacement of $0.1$--$0.5^\circ$ at $<0.5^\circ/\text{s}$, occurring continuously during fixation.
+  \item \textbf{Microsaccades:} small ($<1^\circ$) conjugate saccades at $1$--$3\,\text{Hz}$; velocities up to $40^\circ/\text{s}$; they counteract adaptation and have been linked to covert attention.
+  \item \textbf{Tremor:} high-frequency ($50$--$100\,\text{Hz}$), sub-arcminute oscillations; generally below the detection threshold of any camera-based system.
+\end{itemize}
+Fixation duration in natural reading is $150$--$250\,\text{ms}$ (mean ${\sim}225\,\text{ms}$); in scene viewing it is $200$--$400\,\text{ms}$; in search tasks it can reach $600\,\text{ms}$~\cite{rayner1998eye}.
+
+\paragraph{Smooth pursuit.}
+When the visual system tracks a continuously moving target, it generates smooth pursuit eye movements (SPEMs) with velocity matched to the target.
+Pursuit is only voluntary (it cannot be sustained in the absence of a moving target for more than $\sim1\,\text{s}$) and is driven by retinal slip error~\cite{leigh2015neurology}.
+Key parameters:
+\begin{itemize}
+  \item \textbf{Target speed range:} $0$--$30^\circ/\text{s}$; beyond $\approx 30^\circ/\text{s}$ the system falls behind and supplements pursuit with catch-up saccades.
+  \item \textbf{Pursuit gain:} $\text{eye velocity} / \text{target velocity}$; healthy adults maintain gain $0.95$--$1.0$ for speeds below $25^\circ/\text{s}$; gain drops at higher speeds and in various neurological conditions.
+  \item \textbf{Latency:} $\approx 100\,\text{ms}$ to initiate from a stationary fixation.
+\end{itemize}
+Smooth pursuit is problematic for I-VT classifiers (see Section~\ref{sec:ivt_pursuit} below) and useful for implicit calibration~\cite{vidal2013pursuits}.
+
+\paragraph{Vergence.}
+Vergence movements are \textit{disjunctive}: the eyes rotate in opposite directions (converging or diverging) to maintain binocular single vision as target distance changes.
+Vergence velocity is slow ($5$--$25^\circ/\text{s}$); fusion is maintained for targets from $\approx 20\,\text{cm}$ to optical infinity~\cite{leigh2015neurology}.
+Vergence is important for 3D/AR/VR eye tracking~--- estimating vergence angle encodes depth of fixation and is used for varifocal displays and depth-of-field rendering.
+In monocular 2D screen-based tracking it is generally not modeled.
+
+\paragraph{Vestibulo-ocular reflex (VOR).}
+The VOR counter-rotates the eyes to compensate for head rotations, stabilizing the retinal image during head movement.
+It is driven by the semicircular canals of the vestibular system with a latency of only $7$--$15\,\text{ms}$ (the fastest oculomotor reflex).
+VOR gain is close to 1.0 for frequencies up to $\approx5\,\text{Hz}$.
+For head-mounted eye trackers, the VOR is the primary mechanism maintaining stable gaze during locomotion; algorithms must distinguish true gaze shifts from head-compensating eye rotations.
+
+\paragraph{Optokinetic nystagmus (OKN).}
+When a large textured field moves across the visual field (as when watching scenery from a moving vehicle), the visual system generates an alternating pattern of smooth tracking (slow phase, velocity-matched to the stimulus) followed by a resetting saccade (fast phase)~--- optokinetic nystagmus.
+OKN is a reflexive response that cannot be fully suppressed.
+For screen-based tracking with a static screen, OKN is not typically encountered; it is relevant when tracking gaze during video stimuli with large global motion, or in clinical screening (pediatric nystagmus, vestibular assessment).
+
+%% ------------------------------------------------------------
+\subsection{Implications for Algorithm Design}
+\label{sec:physio_implications}
+%% ------------------------------------------------------------
+
+\paragraph{Temporal resolution requirements.}
+The shortest behaviorally relevant event is a microsaccade (${\sim}10$--$30\,\text{ms}$).
+For \textit{fixation detection}, a sampling rate of $50\,\text{Hz}$ ($20\,\text{ms}$ bins) captures the onset and end of all saccades ($>20\,\text{ms}$) and resolves fixation durations to within one sample period~\cite{salvucci2000identifying}.
+$30\,\text{Hz}$ (standard webcam) is marginally sufficient for fixation/saccade segmentation but misses brief glances and precise saccade onset timing.
+$>120\,\text{Hz}$ is needed to study microsaccade dynamics or reading metrics requiring $5$--$10\,\text{ms}$ timing precision.
+
+\paragraph{I-VT velocity threshold rationale.}
+\label{sec:ivt_pursuit}
+The I-VT algorithm classifies samples as saccadic if instantaneous velocity exceeds a threshold $\theta_v$~\cite{salvucci2000identifying}.
+Choosing $\theta_v \approx 30$--$100^\circ/\text{s}$ exploits a natural \emph{velocity gap} in the human oculomotor repertoire:
+fixational movements ($\text{drift} < 0.5^\circ/\text{s}$, microsaccades $<40^\circ/\text{s}$) are clearly separated from main saccades ($>80^\circ/\text{s}$ for $>2^\circ$ amplitude).
+However, \textit{smooth pursuit} ($5$--$30^\circ/\text{s}$) occupies an intermediate velocity band that overlaps both fixation and small-saccade ranges.
+I-VT therefore misclassifies pursuit intervals~--- labeling them neither as fixations nor as saccades, or fragmenting them into many spurious short fixations.
+This is a well-known limitation of the method~\cite{startsev2017one}; more sophisticated classifiers (I-HMM, I-DT, NSLR-HMM) handle pursuit as a distinct state.
+
+\paragraph{Kappa angle and the calibration floor.}
+As noted in Section~\ref{sec:physiology}, the per-person kappa offset (mean $5^\circ$, range $2$--$9^\circ$) is not recoverable from the optical axis alone.
+Any calibration-free algorithm that tracks the optical axis incurs this systematic offset.
+A minimal per-person calibration~--- as few as 1--5 gaze targets~--- can estimate and remove the kappa offset, yielding a dramatic accuracy improvement.
+This is the dominant motivation for the calibration step in virtually every practical system, including Saccade~\cite{papoutsaki2016webgazer}, FAZE~\cite{park2019faze}, and commercial trackers.
+
+\paragraph{Blink detection and masking.}
+The human eye blinks spontaneously at $8$--$21$ blinks per minute (mean ${\sim}15\,\text{min}^{-1}$)~\cite{bentivoglio1997analysis}.
+Each blink occludes the pupil and iris for approximately $150$--$400\,\text{ms}$ (full closure phase ${\sim}100\,\text{ms}$, reopening ${\sim}200\,\text{ms}$).
+During a blink, any pupil/glint detection fails, gaze estimation produces garbage, and the instantaneous velocity of the estimated gaze point spikes to thousands of $^\circ/\text{s}$.
+Any pipeline that computes gaze velocity (for I-VT or temporal smoothing) \emph{must} detect and mask blink intervals, otherwise blink artifacts contaminate the classification output.
+Detection is typically done by monitoring pupil confidence, pupil area, or eyelid-closure landmarks~\cite{salvucci2000identifying}.
+
+%% ------------------------------------------------------------
+\subsection{Psychophysics of Gaze Accuracy}
+%% ------------------------------------------------------------
+
+\paragraph{Just-noticeable difference for gaze shift.}
+The smallest gaze shift that reliably activates a different set of foveal receptors corresponds to the minimum angle of resolution (${\sim}0.5$--$1\,\text{arcmin}$ in photopic conditions)~\cite{curcio1990human}.
+However, for purposes of eye tracking the relevant metric is the accuracy required to distinguish between competing hypotheses about \textit{where} the observer was looking.
+
+\paragraph{Reading detection.}
+Adjacent lines of text at a typical monitor viewing distance ($60\,\text{cm}$) with $12\,\text{pt}$ font are separated by approximately $5$--$7\,\text{mm}$, subtending $0.5$--$0.7^\circ$~\cite{rayner1998eye}.
+Distinguishing fixations on consecutive lines therefore requires accuracy $\lesssim 0.5^\circ$~--- achievable only with dedicated NIR hardware ($0.3$--$0.5^\circ$) or with very careful per-session calibration and low head movement.
+
+\paragraph{HCI vs.\ clinical vs.\ driving.}
+\begin{itemize}
+  \item \textbf{HCI (region-of-interest dwell):} AOIs of $3$--$5^\circ$ are typical for button-level selection; $1$--$2^\circ$ accuracy is sufficient~\cite{kar2017review}.
+  \item \textbf{Clinical assessment (e.g., visual field screening, reading disorder diagnosis):} requires $0.5$--$1^\circ$ to distinguish between fixations on neighboring characters or to resolve microsaccadic inhibition~\cite{leigh2015neurology}.
+  \item \textbf{Driving and scene viewing:} Objects of interest (signs, pedestrians) typically subtend $2$--$10^\circ$; $2$--$3^\circ$ accuracy is sufficient for most tasks, and $5^\circ$ is acceptable for gross AOI analysis~\cite{holmqvist2011eye}.
+  \item \textbf{Foveal rendering (VR/AR):} To restrict high-fidelity rendering to the perceptual foveal window (${\sim}2^\circ$), accuracy $<1^\circ$ is required; current consumer headsets (Meta Quest Pro, Varjo) achieve $1$--$1.5^\circ$ with built-in IR trackers.
+\end{itemize}
+
+Saccade's current $2.2^\circ$ accuracy places it squarely in the HCI and coarse scene-viewing regime~--- sufficient for region-level attention analysis but not for reading research or clinical work.
+
+%% ------------------------------------------------------------
+\subsection{Head-Eye Coordination: Donders' and Listing's Laws}
+%% ------------------------------------------------------------
+
+\paragraph{Donders' law.}
+Donders' law (1847) states that, for any given gaze direction, the torsional orientation of the eye is uniquely determined~--- independent of the path by which that gaze direction was reached~\cite{donders1870accommodation}.
+Practically: given a target direction, there is only one valid eye orientation, so the eye rotation state has only 2 degrees of freedom (horizontal and vertical gaze angle), not 3.
+This is enormously simplifying for 3D eye model fitting: torsion need not be independently estimated.
+
+\paragraph{Listing's law.}
+Listing's law (the empirical refinement of Donders') states more precisely that the eye's orientation at any gaze direction can be expressed as a single rotation about an axis that lies in a plane called \textit{Listing's plane}~--- the set of all axes perpendicular to the \textit{primary direction} (straight-ahead gaze)~\cite{listing1854beitrag,tweed1990implications}.
+In quaternion terms, if $\mathbf{q}_0$ is the primary position, all achievable eye orientations $\mathbf{q}$ satisfy $\text{Im}(\mathbf{q}_0^{-1} \mathbf{q}) \perp \hat{p}$ where $\hat{p}$ is the primary gaze direction.
+This eliminates torsional degrees of freedom and constrains 3D eye orientation to a 2D manifold (the \emph{half-angle rule} for torsion as a function of horizontal and vertical rotation).
+
+\paragraph{VOR and Listing's law.}
+During head rotations, the VOR violates Listing's law: to achieve perfect image stabilization the eye must counter-rotate about exactly the head rotation axis, which is generally not in Listing's plane.
+The VOR therefore introduces torsional components that would not appear during head-stationary gaze shifts.
+For head-mounted trackers (which measure eye orientation relative to the head), this means the torsional state does vary with head movement, and some trackers must explicitly model torsion to correctly reconstruct gaze-in-world.
+
+\paragraph{Algorithmic implications.}
+Listing's law is exploited in geometric 3D eye model fitting to reduce the degrees of freedom~\cite{swirski2013fully}:
+\begin{enumerate}
+  \item The constraint eliminates torsion as a free parameter, reducing the eye state from SO(3) to a 2D gaze direction.
+  \item It provides a regularization constraint when fitting eye orientation from noisy ellipse observations.
+  \item Violations of Listing's law~--- due to head movement, VOR, or convergence~--- signal conditions under which the simplified model breaks down.
+\end{enumerate}
+Appearance-based methods (Sections~\ref{sec:appearance}--\ref{sec:normalization}) do not explicitly use Listing's law, but it is implicitly encoded in any training set collected during normal head-stationary viewing~--- all training labels will satisfy the law, biasing the model toward Listing-compliant outputs.
+
+%% ============================================================
+\section{Taxonomy of Eye Tracking Approaches}
+\label{sec:taxonomy}
+%% ============================================================
+
+Eye tracking pipelines can be decomposed along two independent axes:
+
+\paragraph{Hardware axis.}
+\begin{itemize}
+  \item \textbf{IR-based} (high accuracy, $0.3$--$1^\circ$): dedicated NIR cameras + IR illuminators produce corneal reflections (glints) that encode eye rotation. Used in Tobii, EyeLink, Pupil Labs Core.
+  \item \textbf{RGB webcam} (medium accuracy, $2$--$5^\circ$): standard laptop or smartphone front camera. No special illumination. Only this category is relevant to Saccade.
+  \item \textbf{Head-mounted (wearable)} (high accuracy, IR): camera mounted on glasses; eye fills most of the frame (PuRe and ElSe are designed for this case).
+\end{itemize}
+
+\paragraph{Algorithm axis.}
+\begin{enumerate}
+  \item \textbf{Model-based (geometric)}: fits a 3D physical eye model (sphere + corneal sphere) to observed pupil ellipse and glints. Dominant in IR systems.
+  \item \textbf{Appearance-based}: maps eye/face images directly to gaze direction via learned regression or classification. Dominant in RGB systems.
+  \item \textbf{Hybrid}: uses a 3D head-pose estimate to normalize appearance, then applies a learned regressor.
+\end{enumerate}
+
+The Saccade pipeline is currently \textbf{hybrid}: it detects facial landmarks for head-pose estimation and uses appearance regression (ridge regression on eye patches). The CNN-based path (currently experimental) attempts to use pretrained appearance-based models with Sugano normalization.
+
+%% ============================================================
+\section{Pupil and Eye Center Detection}
+\label{sec:pupil}
+%% ============================================================
+
+Accurate pupil localization is the first stage of any pipeline. For IR head-mounted trackers the pupil appears as a well-contrasted dark ellipse; for visible-light remote cameras the task is harder.
+
+\subsection{Gradient-Based Methods}
+
+\subsubsection{Timm \& Barth (2011)}
+
+\textbf{Key idea.} Timm and Barth~\cite{timm2011accurate} formulate eye center localization as an optimization problem over gradient fields.
+For each candidate center $\mathbf{c}$, the objective aggregates how well the unit displacement vectors $\mathbf{d}_i = (\mathbf{x}_i - \mathbf{c})/\|\mathbf{x}_i - \mathbf{c}\|$ align with image gradients $\mathbf{g}_i$:
+\begin{equation}
+  c^* = \arg\max_{\mathbf{c}} \frac{1}{N} \sum_{i=1}^{N} w(\mathbf{x}_i) \left(\mathbf{d}_i^{\mathsf{T}} \mathbf{g}_i\right)^2,
+\end{equation}
+where $w(\mathbf{x}_i)$ is a weight that emphasizes dark pixels (the pupil region).
+A coarse-to-fine strategy accelerates computation to sub-millisecond levels.
+
+\textbf{Accuracy.} $>90\%$ detection rate within $5\,\text{px}$ on the BioID dataset.
+In the Saccade implementation, Timm runs at $160\times120$ (fast mode, ${\sim}0.5\,\text{ms}$) or $320\times240$ (precise mode, ${\sim}2\,\text{ms}$) and is used as a coarse seed for PuRe.
+
+\textbf{Limitations.} Breaks under strong oblique illumination or heavy eyelash occlusion; does not produce a reliable confidence score.
+
+\subsection{Ellipse-Fitting Methods}
+
+\subsubsection{Swirski, Bulling \& Dodgson (2012)}
+
+\textbf{Key idea.} Swirski et al.~\cite{swirski2012robust} proposed a three-stage pipeline for \textit{highly off-axis} head-mounted cameras where the pupil is significantly eccentric and partially occluded:
+(1) Haar-like coarse localization;
+(2) k-means segmentation;
+(3) image-aware RANSAC ellipse fitting that scores inliers by matching edge gradient directions to the candidate ellipse normal.
+
+\textbf{Accuracy.} Competitive on off-axis datasets; available in PyPupilEXT~\cite{pypupilext}.
+
+\subsubsection{ExCuSe and ElSe (Fuhl et al., 2015--2016)}
+
+Fuhl et al.\ proposed two successive algorithms.
+\textbf{ExCuSe}~\cite{fuhl2015excuse} uses oriented histograms of edge features (Angular Integral Projection Function) to handle occlusion and illumination changes.
+\textbf{ElSe}~\cite{fuhl2016else} adds a multi-stage ellipse candidate selection with fast rejection criteria.
+In a comparative evaluation on 3\,202 remote eye-tracking images with challenging conditions, ElSe achieved the best detection rate among classical methods.
+Both are available in PyPupilEXT.
+
+\subsubsection{PuRe and PuReST (Santini et al., 2018)}
+
+\textbf{Key idea.} PuRe~\cite{santini2018pure} introduces a novel edge-segment combination strategy:
+(1) Canny edge detection;
+(2) extraction of connected edge segments;
+(3) conditional combination of nearby segments into candidate arcs;
+(4) Fitzgibbon direct least-squares ellipse fitting~\cite{fitzgibbon1999direct};
+(5) scoring via a composite confidence $\psi = (\rho + \theta + \gamma)/3$ where $\rho$ penalizes elongation, $\theta$ measures angular spread consistency, and $\gamma$ measures outline contrast.
+
+On $>316\,000$ images from four head-mounted trackers, PuRe improved detection rate by $>10$ percentage points over prior state of the art on the two most challenging datasets.
+\textbf{PuReST}~\cite{santini2018purest} adds temporal tracking on top of PuRe, providing $2.74\times$ speedup while maintaining accuracy.
+
+The Saccade project implements PuRe natively and uses it as the \textit{precision stage} after Timm seeding (the GSAR-PuRe adaptive tracker in \texttt{src/tracker.rs}).
+
+\textbf{Important caveat.} PuRe was designed for \textit{near-infrared head-mounted cameras} where the pupil-to-background contrast is $\sim10\times$ higher than in visible-light remote setups.
+Applying PuRe to a standard RGB webcam image produces many spurious edge segments and lower confidence scores.
+This partially explains why the Saccade project's best configuration relies on \textit{appearance features of the eye region} (ridge regression) rather than precise pupil localization.
+
+\subsection{Deep Learning-Based Pupil Detection (2019--2025)}
+
+\subsubsection{RITnet (2019)}
+
+Perry et al.\ introduced \textbf{RITnet}~\cite{ritnet2019}, a U-Net-style semantic segmentation network trained on the OpenEDS Facebook VR dataset to segment eye images into four classes: background, sclera, iris, and pupil.
+RITnet established the foundation for subsequent DL-based pupil work.
+
+\subsubsection{EllSeg / EllSegGen (2021--2022)}
+
+Kothari et al.~\cite{ellseg2021} proposed \textbf{EllSeg}, which adds an explicit \textit{ellipse fit loss} to a U-Net, forcing the network to produce segmentation masks whose contours are elliptical.
+This enforces the physical shape prior of the pupil/iris.
+EllSegGen extends this with domain generalization.
+
+\subsubsection{Summary: Classical vs. Deep Learning}
+
+A key finding from recent comparative studies~\cite{pupildetect_review2024} is that while DL segmentation methods improve segmentation metrics ($\text{IoU}$, boundary accuracy), their advantage in \textit{end-to-end gaze estimation accuracy} is limited: the bottleneck shifts to gaze mapping, not pupil localization.
+For RGB webcam setups at low resolution (where Saccade operates at $640\times480$ or smaller eye crops), classical methods remain competitive and require no GPU.
+
+%% ============================================================
+\section{Appearance-Based Gaze Estimation}
+\label{sec:appearance}
+%% ============================================================
+
+Appearance-based methods map eye or face images directly to gaze direction $(\theta, \phi)$ (yaw, pitch in head or camera coordinates) via learned regression.
+They require no geometric eye model, work with standard RGB cameras, and generalize across users given sufficient training data.
+This is the dominant paradigm for webcam-based gaze estimation.
+
+\subsection{Data Normalization (Sugano 2014, Zhang 2018)}
+
+Before any model is applied, \textit{data normalization} is essential for cross-person generalization.
+
+\textbf{Sugano et al.~\cite{sugano2014learning}} introduced the normalization concept:
+given a 3D head pose estimate $(\mathbf{R}_h, \mathbf{t}_h)$ from facial landmarks, compute a rotation matrix $\mathbf{R}_n$ that transforms the eye from its current pose to a canonical frontal pose.
+Warp the eye image by applying $\mathbf{R}_n$ (plus a scaling that brings the virtual camera to a fixed distance $d_n = 600\,\text{mm}$ from the eye center).
+
+\textbf{Zhang et al.~\cite{zhang2018revisiting}} identified and corrected a critical error in the original formulation:
+the scaling step incorrectly transforms the gaze label.
+The correction: \textit{remove the scaling}, apply only the rotation $\mathbf{R}_n$ to both image and gaze vector:
+\begin{equation}
+  \mathbf{g}_n = \mathbf{R}_n \mathbf{g}, \quad \quad \hat{I}_n = \text{warp}(I; \mathbf{R}_n, K),
+\end{equation}
+where $K$ is the camera intrinsic matrix and $\text{warp}$ is a perspective warp.
+This corrected normalization is now the \textbf{de facto standard} in virtually all subsequent papers and achieves $9.5$--$32.7\%$ improvement over the original.
+
+\textbf{Relevance to Saccade.} The project's \texttt{src/sugano.rs} implements this normalization (PnP for pose estimation, perspective warp to $448\times448$ canonical crop). It is currently experimental and not production-ready; completing it is a critical prerequisite for making the CNN gaze models work correctly.
+
+\subsection{MPIIGaze --- Zhang et al. (2015, 2019)}
+
+Zhang et al.~\cite{zhang2015appearance,zhang2019mpiigaze} created the \textbf{MPIIGaze} dataset (213\,659 images, 15 subjects, collected over 3+ months during naturalistic laptop use) and trained a CNN on normalized eye crops.
+They demonstrated that \textit{in-the-wild data collected during everyday use} is essential for generalization --- laboratory datasets fail to capture real-world appearance variation.
+
+\textbf{Results.}
+\begin{itemize}
+  \item Single-eye CNN: $6.3^\circ$ mean angular error (MAE) on leave-one-out evaluation.
+  \item Multimodal CNN (eye + head pose): $5.4^\circ$ MAE.
+\end{itemize}
+
+MPIIGaze remains the \textbf{standard benchmark} for comparing methods.
+An extended variant, \textbf{MPIIFaceGaze} (37\,667 full-face images with landmarks), is used for full-face methods.
+
+\textbf{Repository.} Unofficial PyTorch: \url{https://github.com/hysts/pytorch_mpiigaze}.
+
+\subsection{Full-Face Gaze Estimation --- Zhang et al. (2017)}
+
+Zhang et al.~\cite{zhang2017written} showed that using the \textit{full face image} (not just eye crops) as CNN input improves accuracy.
+A spatial weighting mechanism (attention over face regions) allows the network to exploit periocular cues, head pose, and lighting context beyond the iris region.
+
+\textbf{Results.} $4.93^\circ$ MAE on MPIIFaceGaze, a 7.2\% improvement over the second-best single-face model at publication.
+
+\subsection{iTracker / GazeCapture --- Krafka et al. (2016)}
+
+Krafka et al.~\cite{krafka2016eye} at MIT CSAIL collected \textbf{GazeCapture}: $>2.5$ million images from ${\sim}1\,500$ subjects on iOS devices, making it the largest appearance-based gaze dataset at the time.
+Their \textbf{iTracker} model uses a four-stream CNN: left eye, right eye, face crop, and a binary face-grid mask (indicating head position in the frame).
+The face-grid encodes coarse head position without requiring explicit head pose estimation.
+
+\textbf{Results.} Without calibration: $1.71\,\text{cm}$ on iPhone (${\approx}2.4^\circ$), $2.53\,\text{cm}$ on iPad.
+With simulated per-person calibration: $1.34\,\text{cm}$ / $2.12\,\text{cm}$.
+
+\textbf{Repository.}
+Official: \url{https://github.com/CSAILVision/GazeCapture}.
+PyTorch reimplementation: \url{https://github.com/yihuacheng/Itracker}.
+
+\subsection{RT-GENE --- Fischer et al. (2018)}
+
+Fischer et al.~\cite{fischer2018rtgene} proposed \textbf{RT-GENE} for gaze estimation ``in natural environments.''
+Key contributions:
+(1) a technique for creating training data by \textit{inpainting} the eye region covered by the head-mounted tracker used to collect ground truth;
+(2) an \textit{ensemble of CNNs} for improved accuracy;
+(3) the RT-GENE dataset (${\sim}122\,000$ images, 15 subjects, with motion capture + Pupil Labs head-mounted ground truth).
+
+\textbf{Results.} $7.7^\circ$ on RT-GENE dataset (challenging); $4.3^\circ$ on MPIIGaze ($10.4\%$ improvement over prior SOTA).
+
+\textbf{Repository.} \url{https://github.com/Tobias-Fischer/rt_gene}
+
+\subsection{GazeML / ELG --- Park et al. (2018)}
+
+Park et al.~\cite{park2018learning} proposed using \textit{eye region landmarks} (eyelid contour, iris boundary) as an intermediate representation.
+The \textbf{ELG} (Eye Landmark + Gaze) model uses an hourglass network to simultaneously detect landmarks and regress gaze, trained on synthetic UnityEyes~\cite{wood2016learning} data plus real data.
+Landmark prediction provides an interpretable intermediate signal and enables domain adaptation via synthetic pretraining.
+
+\textbf{Results.} $4.63^\circ$ MAE on MPIIGaze.
+
+\textbf{Repository.} \url{https://github.com/swook/GazeML}
+
+\subsection{FAZE --- Park et al. (2019)}
+
+Park et al.~\cite{park2019faze} from NVIDIA proposed \textbf{FAZE} (Few-Shot Adaptive Gaze Estimation), a meta-learning (MAML-based) approach to rapid per-user personalization.
+The model is trained to \textit{rapidly adapt} to a new user given only a few calibration samples (as few as 1--9 gaze targets).
+
+\textbf{Key insight.} User-specific appearance factors (iris texture, eyelid geometry) and kappa offset (angle between optical and visual axis, ${\approx}4$--$7^\circ$, varies per person) limit cross-person generalization.
+A few per-user samples can recover these factors if the model is meta-trained to adapt.
+
+\textbf{Results.}
+\begin{itemize}
+  \item GazeCapture, no calibration ($k=0$): $7.17^\circ$.
+  \item GazeCapture, $k=9$ calibration samples: $\mathbf{3.18^\circ}$ ($19\%$ improvement over prior SOTA).
+  \item MPIIGaze, $k=9$: $3.88^\circ$ ($17\%$ improvement).
+\end{itemize}
+
+\textbf{Repository.} \url{https://github.com/NVlabs/few_shot_gaze}
+
+\textbf{Relevance to Saccade.} The FAZE result of $3.18^\circ$ with only 9 calibration samples (vs. Saccade's 45-click calibration achieving $2.2^\circ$ on a single user) shows that meta-learning approaches are extremely effective --- but they require pretrained models fine-tuned on large multi-subject datasets.
+
+\subsection{Gaze360 --- Kellnhofer et al. (2019)}
+
+Kellnhofer et al.~\cite{kellnhofer2019gaze360} collected \textbf{Gaze360}: 238 subjects in indoor and outdoor environments, labeled with 3D gaze across a full $360^\circ$ range of viewing directions.
+The model incorporates \textit{temporal context} via LSTM and produces \textit{uncertainty estimates}.
+
+\textbf{Results.} $9.26^\circ$ on the Gaze360 test set (this dataset is significantly harder due to full $360^\circ$ range); $3.36^\circ$ on MPIIFaceGaze cross-dataset.
+
+\textbf{Repository.} \url{https://github.com/erkil1452/gaze360}
+
+\subsection{ETH-XGaze --- Zhang et al. (2020)}
+
+Zhang et al.~\cite{zhang2020ethxgaze} created \textbf{ETH-XGaze}: $>1$ million high-resolution face images from 110 subjects captured simultaneously by 18 DSLR cameras, covering extreme head poses ($\pm60^\circ$ yaw, $\pm40^\circ$ pitch) and extreme gaze targets.
+A baseline ResNet-50 achieves ${\approx}4.50^\circ$ on the benchmark; the top entry (Cai et al., 2021) achieves $3.11^\circ$.
+
+ETH-XGaze has become the \textbf{standard large-scale training set} for domain-generalizable gaze models.
+Training on ETH-XGaze significantly improves cross-dataset transfer to MPIIGaze, GazeCapture, and EYEDIAP.
+
+\textbf{Repository.} \url{https://github.com/xucong-zhang/ETH-XGaze}
+
+\subsection{L2CS-Net --- Abdelrahman et al. (2022)}
+
+Abdelrahman et al.~\cite{abdelrahman2022l2cs} proposed \textbf{L2CS-Net}, a two-branch CNN where each branch predicts one gaze angle (yaw or pitch) with its own dedicated loss function.
+The loss combines angle-bin classification and regression within each branch, forcing the network to learn maximally discriminative features for each axis independently.
+
+\textbf{Results.} $3.92^\circ$ MAE on MPIIGaze; $10.41^\circ$ on Gaze360.
+
+\textbf{Repository.} \url{https://github.com/Ahmednull/L2CS-Net}
+
+\subsection{GazeTR (Transformer) --- Cheng \& Lu (2022)}
+
+Cheng and Lu~\cite{cheng2022gazetr} applied Vision Transformers to gaze estimation.
+The key finding: a \textbf{hybrid CNN-Transformer} (CNN backbone + Transformer head) significantly outperforms both a pure Transformer (ViT) and a pure CNN.
+The Transformer attention head captures global spatial relationships in the eye/face that CNNs miss, while the CNN provides local texture features critical for iris appearance.
+
+\textbf{Results.} State of the art at publication on MPIIGaze, MPIIFaceGaze, and Gaze360.
+
+\textbf{Repository.} \url{https://github.com/yihuacheng/GazeTR}
+
+\subsection{Recent SOTA (2023--2025)}
+
+The field continues to improve rapidly, with transformers, vision-language models,
+diffusion processes, and state-space models all being applied to gaze estimation.
+
+\textbf{Transformer variants (2023--2024):}
+\begin{itemize}
+  \item \textbf{GazeSwin}~\cite{gazeswin2024}: Swin Transformer backbone; outperforms
+        plain ViT on gaze by exploiting hierarchical feature maps.
+  \item \textbf{GazeTR-Hybrid}~\cite{cheng2022gazetr}: ResNet-18 features + Transformer encoder;
+        $3.43^\circ$ on MPIIFaceGaze, $4.00^\circ$ on EYEDIAP --- previously best published.
+  \item \textbf{TransGaze}~\cite{transgaze2024}: plain (non-hierarchical) ViT adaptation;
+        explores positional encoding and patch-size tradeoffs for gaze.
+\end{itemize}
+
+\textbf{Vision-language models (AAAI 2024):}
+\begin{itemize}
+  \item \textbf{CLIP-Gaze}~\cite{clipgaze2024}: first CLIP-based gaze estimation.
+        Repels appearance features from gaze-irrelevant CLIP text concepts via contrastive loss;
+        uses per-person prompt tuning for adaptation.
+        Improves cross-domain accuracy on four ETH-XGaze transfer tasks.
+  \item \textbf{GazeCLIP}~\cite{gazeclip2024}: independent CLIP backbone + multimodal
+        fusion module for text--face pairs; evaluated on three challenging datasets.
+\end{itemize}
+
+\textbf{Mixture-of-Experts / context-aware (2025):}
+\begin{itemize}
+  \item \textbf{GazeFormer-MoE}~\cite{gazeformermoe2025}: CLIP global features fused with
+        per-patch CNN tokens inside a Mixture-of-Experts transformer.
+        Prototype banks encode illumination, head pose, background, and gaze clusters.
+        \textbf{MPIIFaceGaze: $2.49^\circ$; ETH-XGaze: $1.44^\circ$} (arXiv preprint,
+        not yet peer-reviewed).
+\end{itemize}
+
+\textbf{State-space models / Mamba (2025):}
+\begin{itemize}
+  \item \textbf{GazeVM-Hybrid}~\cite{gazevm2025}: ResNet-34 CNN for local features +
+        VMamba selective-scan blocks for long-range global context;
+        first application of Mamba-family architectures to gaze estimation.
+\end{itemize}
+
+\textbf{Diffusion-based methods (2025):}
+\begin{itemize}
+  \item \textbf{GazeDiff}~\cite{gazediff2025} (IJCAI 2025): self-supervised pre-training
+        via a conditional diffusion model ---
+        given a reference image encoding a gaze direction, reconstruct target face.
+        The learned representation is transferred to estimation via fine-tuning.
+        Architecture-agnostic; applicable to any existing estimator.
+  \item \textbf{GazeGaussian}~\cite{gazegaussian2024}: 3D Gaussian Splatting for photorealistic
+        gaze redirection; used as data augmentation to improve estimation accuracy.
+\end{itemize}
+
+\textbf{Gaze capsule networks (2025):}
+\begin{itemize}
+  \item \textbf{GazeCapsNet}~\cite{gazecapsnet2025}: capsule routing for
+        equivariance to spatial transformations including illumination changes;
+        $15\%$ MAE reduction on ETH-XGaze and Gaze360.
+\end{itemize}
+
+\textbf{Current SOTA MAE on standard benchmarks} (as of mid-2025):
+\begin{center}
+\begin{tabular}{lcl}
+\hline
+\textbf{Dataset} & \textbf{Best MAE} & \textbf{Method} \\
+\hline
+MPIIFaceGaze (LOPO) & $2.49^\circ$ & GazeFormer-MoE (preprint) \\
+MPIIFaceGaze (LOPO) & $3.43^\circ$ & GazeTR-Hybrid (peer-reviewed) \\
+ETH-XGaze & $1.44^\circ$ & GazeFormer-MoE (preprint) \\
+Gaze360 & $5.10^\circ$ & GazeCapsNet \\
+GazeCapture (no calib.) & $\approx1.7$ cm & iTracker (2016 baseline) \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Important caveat:} The GazeFormer-MoE numbers ($2.49^\circ$, $1.44^\circ$)
+are from an unreviewed arXiv preprint (Jan 2025) and represent a $\approx28\%$ relative
+improvement over previously accepted SOTA.
+Šikić et al.~\cite{sikic2024reevaluation} found that $\approx60\%$ of published gaze results
+cannot be reproduced to within 10\% relative error; the GazeFormer-MoE numbers should be
+treated as indicative until peer-reviewed.
+
+\subsection{New Modalities (2024--2025)}
+
+\textbf{Event cameras (neuromorphic sensors).}
+Event cameras report per-pixel brightness \emph{changes} asynchronously,
+with microsecond temporal resolution, no motion blur, and very low power consumption.
+The \textbf{3ET+ dataset}~\cite{threet2025} (CVPR 2025 challenge)
+provides event-camera eye recordings from 13 participants across five eye-movement tasks
+(random, saccade, reading, smooth pursuit, blink).
+The best challenge result is a Euclidean pupil-center distance of $1.61$ px
+(winner: BRAT by USTCEventGroup).
+Event-camera eye tracking is a growing field: the sparsity of events makes it ideal for
+wearable/VR headsets where power budget is critical.
+
+\textbf{VR/AR gaze.}
+Commercial VR headsets (Meta Quest Pro, Apple Vision Pro, Valve Index) integrate
+dedicated IR eye trackers, but published deep-learning papers using these platforms remain rare.
+\textbf{FovealNet}~\cite{fovealnet2025} (IEEE VR/TVCG 2025) addresses the
+\emph{long-tail error distribution} problem in foveated rendering:
+occasional large gaze errors degrade rendering quality disproportionately.
+FovealNet reduces the 95th-percentile error from $8.21^\circ$ to $\mathbf{2.31^\circ}$
+and the maximum error from $24.2^\circ$ to $5.22^\circ$, using software-level
+``event-based cropping'' (no dedicated event camera hardware required).
+
+\textbf{Synthetic datasets.}
+\textbf{GazeGene}~\cite{gazegene2025} (CVPR 2025) is the first large-scale synthetic dataset
+with \emph{3D eyeball structural annotations}:
+$56\,\text{subjects} \times 9\,\text{cameras} \times 2{,}000\,\text{frames} = 1{,}008{,}000$ images.
+Annotations include pupil, iris, eyeball, optical axis, and visual axis in 3D ---
+unavailable in any real-world dataset.
+Variations cover expressions, blink states, pupil sizes, and lighting conditions
+(temperature, intensity, direction).
+Pre-training on GazeGene and fine-tuning on real data improves
+cross-dataset generalisation on high-resolution inputs.
+
+%% ============================================================
+\section{Geometric and Model-Based Gaze Estimation}
+\label{sec:geometric}
+%% ============================================================
+
+\subsection{Pupil Center Corneal Reflection (PCCR)}
+
+PCCR is the dominant method in commercial IR-based trackers (Tobii, EyeLink, LC Technologies).
+Near-infrared illuminators create specular \textit{corneal reflections} (glints) on the anterior corneal surface.
+The vector from the pupil center to the glint encodes the eye's rotational state.
+With known camera geometry, this vector maps to gaze direction.
+
+Multi-glint setups (2+ LEDs) allow solving for a more accurate 3D eye model.
+\textbf{Accuracy:} High-end systems ($e.g.$, SR Research EyeLink 1000): $0.3$--$0.5^\circ$; consumer-grade (Tobii Eye Tracker 5): $0.5$--$1.0^\circ$.
+This approach is \textit{inapplicable} to standard RGB webcams.
+
+\subsection{3D Eye Model Fitting (Glint-Free)}
+
+Swirski and Dodgson~\cite{swirski2013fully} proposed fitting a two-sphere eye model (large sphere for eyeball, smaller sphere for cornea --- the LeGrand model) to the observed pupil ellipse alone, without any glints.
+The optical axis is derived from the fit; a person-specific $\kappa$/alpha offset converts from optical to visual axis (foveal gaze direction).
+
+\textbf{Accuracy.} Without glints: $3$--$6^\circ$ (RGB-only 3D model), $1.4$--$2.7^\circ$ with depth cameras.
+The kappa offset ($4$--$7^\circ$, highly variable per person) remains the limiting factor without per-user calibration.
+
+\subsection{OpenFace 2.0 --- Baltrušaitis et al. (2018)}
+
+\textbf{OpenFace 2.0}~\cite{baltrusaitis2018openface} is an open-source C++ toolkit providing facial landmark detection, head pose estimation, action unit recognition, and gaze estimation.
+Gaze is estimated by detecting eye landmarks (CLNF-based) and fitting a geometric 3D iris model trained on synthetic SynthesEyes data.
+
+\textbf{Results.} $9.1^\circ$ MAE on MPIIGaze. This is significantly worse than appearance-based methods; geometric methods cannot compensate for the kappa offset without calibration.
+
+\textbf{Repository.} \url{https://github.com/TadasBaltrusaitis/OpenFace}
+
+%% ============================================================
+\section{WebGazer: Browser-Based Appearance Regression}
+\label{sec:webgazer}
+%% ============================================================
+
+\textbf{WebGazer.js}~\cite{papoutsaki2016webgazer} is a JavaScript library that runs entirely in the browser, using the standard webcam.
+It pioneered \textit{implicit calibration}: instead of a dedicated calibration phase, the model is trained passively using mouse click events as ground-truth gaze labels (the user is assumed to be looking at whatever they click).
+
+\textbf{Architecture.}
+\begin{enumerate}
+  \item Face tracking via clmtrackr or TensorFlow.js FaceMesh to detect eye regions.
+  \item Eye patch extraction (grayscale crops resized to $10\times6$).
+  \item Histogram equalization of patches.
+  \item Feature vector: concatenated pixel values or HOG features.
+  \item Online ridge regression: $\boldsymbol{\beta} = (\mathbf{X}^\mathsf{T}\mathbf{X} + \lambda \mathbf{I})^{-1} \mathbf{X}^\mathsf{T} \mathbf{y}$, retrained on each new frame.
+  \item Circular buffer of last 200 samples.
+\end{enumerate}
+
+\textbf{Accuracy.} Best configuration (ridge regression + clmtrackr, controlled calibration): ${\approx}4.17^\circ$, ${\approx}130\,\text{px}$ on typical displays. Practical deployment: $100$--$200\,\text{px}$ ($4$--$8^\circ$).
+
+\textbf{Repository.} \url{https://github.com/brownhci/WebGazer}
+
+\textbf{Saccade connection.} The Saccade project's \texttt{src/ridge.rs} is a direct Rust port of WebGazer's regression core (120-dimensional histogram-equalized eye features, circular buffer, auto-tuned $\lambda$ via leave-one-out cross-validation). Under the same click-based in-distribution validation used by WebGazer it records $142\,\text{px}$ ($2.2^\circ$), improving on the JS baseline primarily due to: better pupil tracking, a clean calibration UI with 45 clicks (vs.\ implicit mouse tracking), and the white-background lighting hack. Under a stricter multi-point out-of-distribution protocol (Section~\ref{sec:evaluation}), the honest figure is $237\,\text{px}$ ($3.7^\circ$)---comparable to WebGazer's ${\approx}4^\circ$.
+
+%% ============================================================
+\section{Head-Pose Normalization}
+\label{sec:normalization}
+%% ============================================================
+
+\subsection{Sugano et al. (2014) --- Original Formulation}
+
+Sugano et al.~\cite{sugano2014learning} introduced data normalization to standardize eye appearance across different head-camera geometries.
+Given head pose $(\mathbf{R}_h, \mathbf{t}_h)$ (from PnP on facial landmarks) and camera intrinsics $\mathbf{K}$:
+
+\begin{enumerate}
+  \item Compute rotation $\mathbf{R}_n$ that brings the head to frontal pose.
+  \item Apply scaling $s_n = d/\|\mathbf{t}_h\|$ to simulate a camera at distance $d_n = 600\,\text{mm}$.
+  \item Warp eye image: $\hat{I} = \text{warp}(I; \mathbf{R}_n, s_n, \mathbf{K})$.
+  \item Transform gaze label: $\hat{\mathbf{g}} = \mathbf{R}_n \mathbf{g}$.
+\end{enumerate}
+
+\subsection{Zhang et al. (2018) --- Corrected Formulation}
+
+Zhang et al.~\cite{zhang2018revisiting} showed the scaling step incorrectly modifies the gaze label.
+The correction removes scaling from the gaze transform (but keeps it for the image warp to maintain appearance normalization):
+\begin{equation}
+  \hat{\mathbf{g}} = \mathbf{R}_n \mathbf{g} \quad \text{(without scaling)}.
+\end{equation}
+This correction yields $9.5$--$32.7\%$ improvement.
+The reference implementation is at \url{https://github.com/xucong-zhang/data-preprocessing-gaze}.
+
+\textbf{Why this matters for Saccade.} Without correct normalization, CNN gaze models receive inconsistently posed inputs, and predicted angles are systematically biased by the user's head pose. Experiment E8 in the Saccade EXPERIMENTS.md achieved $737\,\text{px}$ error ($5.14\times$ worse than the regression baseline) precisely because the Sugano implementation was incorrect or incomplete.
+
+%% ============================================================
+\section{Temporal Filtering and Post-Processing}
+\label{sec:temporal}
+%% ============================================================
+
+Raw gaze estimates are noisy. Two filtering paradigms are commonly used:
+
+\subsection{Kalman Filtering}
+
+A Kalman filter with constant-velocity motion model maintains a state $[x, y, v_x, v_y]^{\mathsf{T}}$:
+\begin{align}
+  \hat{\mathbf{s}}_{t|t-1} &= \mathbf{F} \hat{\mathbf{s}}_{t-1|t-1}, \\
+  \hat{\mathbf{s}}_{t|t} &= \hat{\mathbf{s}}_{t|t-1} + \mathbf{K}_t (\mathbf{z}_t - \mathbf{H} \hat{\mathbf{s}}_{t|t-1}),
+\end{align}
+where $\mathbf{K}_t$ is the Kalman gain (computed from process noise $\mathbf{Q}$ and measurement noise $\mathbf{R}$).
+The Saccade project uses this for \textit{pupil tracking} (\texttt{src/kalman.rs}).
+The innovation (residual) also serves as a confidence estimate for the current detection.
+
+\subsection{One Euro Filter --- Casiez et al. (2012)}
+
+The \textbf{1\euro{} filter}~\cite{casiez2012oef} is an adaptive low-pass filter designed for interactive pointing:
+\begin{equation}
+  f_c(t) = f_{\min} + \beta \left|\frac{d\hat{x}}{dt}\right|,
+\end{equation}
+where $f_c$ is the cutoff frequency, $f_{\min}$ controls minimum smoothing, and $\beta$ is the speed coefficient.
+At low speed the cutoff is low (heavy smoothing, reduces jitter); at high speed the cutoff increases (preserves responsiveness for fast saccades).
+
+The Saccade project applies a 2D 1\euro{} filter (\texttt{src/one\_euro.rs}) to the final gaze estimate.
+
+\subsection{Comparison: Kalman vs. 1€}
+
+\begin{table}[H]
+  \centering
+  \caption{Comparison of temporal filters for gaze smoothing.}
+  \begin{tabular}{lll}
+    \toprule
+    Property & Kalman Filter & 1\euro{} Filter \\
+    \midrule
+    Model & Physical motion model & Adaptive RC low-pass \\
+    Parameters & $\mathbf{Q}$, $\mathbf{R}$ matrices & $f_{\min}$, $\beta$, $f_c$ \\
+    State estimation & Position + velocity & Position only \\
+    Latency at fast motion & Low (velocity prediction) & Low (high cutoff) \\
+    Latency at slow motion & Moderate & High (heavy smoothing) \\
+    Implementation & Medium complexity & Very simple \\
+    Interpretability & High (Bayesian optimal) & High (intuitive) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Eye Movement Event Classification}
+\label{sec:event}
+%% ============================================================
+
+Eye movement signals can be parsed into distinct \textit{events}: fixations (stable gaze, 150--600 ms), saccades (rapid jumps, $<50\,\text{ms}$, velocities up to $700^\circ/\text{s}$), smooth pursuits (tracking moving objects), and blinks.
+
+The seminal taxonomy was established by Salvucci and Goldberg~\cite{salvucci2000identifying}.
+
+\subsection{I-VT (Velocity-Threshold Identification)}
+
+Each sample is classified as fixation or saccade based on a velocity threshold $v_t$ (typically $30$--$100^\circ/\text{s}$):
+\begin{equation}
+  \text{class}(t) = \begin{cases} \text{fixation} & \text{if } v(t) < v_t \\ \text{saccade} & \text{otherwise}. \end{cases}
+\end{equation}
+The Saccade project implements I-VT in \texttt{src/classify.rs} with a threshold of $50\,\text{px/s}$ on the smoothed gaze signal.
+
+\textbf{Pros.} Computationally trivial; interpretable. \textbf{Cons.} A single threshold cannot cleanly separate fixations from smooth pursuits.
+
+\subsection{I-DT (Dispersion-Threshold Identification)}
+
+Detects fixations by requiring gaze to remain within a spatial window of radius $D$ for at least duration $T$:
+a sliding window expands while all points fall within the dispersion threshold, then emits a fixation.
+Typical parameters: $D = 25$--$100\,\text{px}$ ($1$--$3^\circ$), $T = 100$--$200\,\text{ms}$.
+
+\textbf{Pros.} Directly corresponds to the cognitive definition of fixation; handles some noise better than I-VT. \textbf{Cons.} Does not handle smooth pursuit; sensitive to $D$ and $T$.
+
+\subsection{I-HMM (Hidden Markov Model Identification)}
+
+Models gaze as a sequence of hidden states (fixation, saccade, optionally smooth pursuit) with probabilistic transitions.
+Fixation state has low-velocity observations; saccade state has high-velocity observations.
+The Viterbi algorithm finds the most likely state sequence.
+
+\textbf{Pros.} Soft decisions (robust to noise); captures temporal dynamics; extensible to smooth pursuit as a third state. \textbf{Cons.} Requires parameter estimation; more complex implementation.
+
+\subsection{Current Limitations}
+
+Startsev et al.~\cite{startsev2017one} evaluated 10 classification algorithms and found none handles smooth pursuit well; performance on dynamic stimuli (videos) is barely better than chance for I-VT and I-DT.
+Modern approaches add smooth pursuit as a distinct class~\cite{eyemovement_review2022}.
+
+%% ============================================================
+\section{Datasets and Benchmarks}
+\label{sec:datasets}
+%% ============================================================
+
+\begin{table}[H]
+  \centering
+  \caption{Standard gaze estimation datasets. MAE = best reported mean angular error on the dataset's test set. ``Best'' refers to the best-known result at time of writing.}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{llrrllr}
+    \toprule
+    \textbf{Dataset} & \textbf{Year} & \textbf{Subj.} & \textbf{Images} & \textbf{Setting} & \textbf{IR?} & \textbf{Best MAE} \\
+    \midrule
+    MPIIGaze~\cite{zhang2019mpiigaze}    & 2015 & 15  & 213K   & Laptop, in-the-wild  & No  & ${\approx}3.5^\circ$ \\
+    MPIIFaceGaze~\cite{zhang2017written} & 2017 & 15  & 37K    & Laptop, in-the-wild  & No  & ${\approx}3.9^\circ$ \\
+    GazeCapture~\cite{krafka2016eye}     & 2016 & 1500& 2.5M   & Mobile (iOS)         & No  & 1.34 cm (cal.) \\
+    ETH-XGaze~\cite{zhang2020ethxgaze}   & 2020 & 110 & $>$1M  & Lab, 18 cameras      & No  & ${\approx}3.1^\circ$ \\
+    Gaze360~\cite{kellnhofer2019gaze360} & 2019 & 238 & 172K   & Indoor/outdoor       & No  & ${\approx}9.3^\circ$ \\
+    EYEDIAP~\cite{eyediap2014}           & 2014 & 16  & 94 sess.& Lab, RGB+D          & No  & ${\approx}3.2^\circ$ \\
+    Columbia Gaze~\cite{smith2013gaze}   & 2013 & 56  & 5880   & Lab, constrained     & No  & $3$--$5^\circ$ \\
+    RT-GENE~\cite{fischer2018rtgene}     & 2018 & 15  & 122K   & Lab, head-mounted GT & No  & ${\approx}4.3^\circ$ \\
+    EVE~\cite{park2020eve}               & 2020 & 54  & 12.3M  & Lab, video-based     & No  & 2.49$^\circ$ \\
+    UnityEyes~\cite{wood2016learning}    & 2016 & ---  & 1M+    & Synthetic            & No  & training only \\
+    OpenEDS~\cite{openeds2019}           & 2019 & 152 & 12.7K  & VR headset (NIR)     & Yes & segmentation \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Notes on benchmark comparability.}
+Angular error numbers across papers are \textit{not directly comparable} without specifying:
+(1) whether leave-one-subject-out (LOSO) or a fixed train/test split is used;
+(2) whether data normalization was applied to both training and test sets;
+(3) screen-coordinate vs. 3D-angular error.
+The GazeHub leaderboard~\cite{cheng2024appearance} (\url{https://phi-ai.buaa.edu.cn/Gazehub/}) provides the most recent apples-to-apples comparison under a unified evaluation framework.
+
+%% ============================================================
+\section{Comparative Summary}
+\label{sec:comparison}
+%% ============================================================
+
+\begin{table}[H]
+  \centering
+  \caption{Comparison of appearance-based gaze estimation methods on MPIIGaze (LOSO). All methods work with RGB cameras (no IR). ``Cal.'' = per-user calibration samples required. Methods marked with * use data normalization~\cite{zhang2018revisiting}.}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{llcccl}
+    \toprule
+    \textbf{Method} & \textbf{Year} & \textbf{MAE} & \textbf{Cal.} & \textbf{Input} & \textbf{Backbone} \\
+    \midrule
+    OpenFace 2.0~\cite{baltrusaitis2018openface}  & 2018 & $9.1^\circ$ & No  & Face      & Geometric 3D iris \\
+    Zhang et al. (CNN)*~\cite{zhang2015appearance}& 2015 & $6.3^\circ$ & No  & Eye crop  & LeNet-style CNN \\
+    GazeML/ELG*~\cite{park2018learning}           & 2018 & $4.63^\circ$& No  & Eye crop  & Hourglass + HG \\
+    RT-GENE*~\cite{fischer2018rtgene}              & 2018 & $4.3^\circ$ & No  & Eye crop  & VGG ensemble \\
+    Full-Face*~\cite{zhang2017written}             & 2017 & $4.93^\circ$& No  & Full face & LeNet+attention \\
+    FAZE* (k=0)~\cite{park2019faze}                & 2019 & $7.17^\circ$& No  & Eye crop  & DenseNet+meta \\
+    FAZE* (k=9)~\cite{park2019faze}                & 2019 & $3.88^\circ$& 9   & Eye crop  & DenseNet+meta \\
+    L2CS-Net*~\cite{abdelrahman2022l2cs}           & 2022 & $3.92^\circ$& No  & Full face & ResNet-50 dual-br. \\
+    GazeTR-Hybrid*~\cite{cheng2022gazetr}          & 2022 & ${\approx}3.5^\circ$ & No & Full face & CNN+Transformer \\
+    \midrule
+    \textit{WebGazer.js}~\cite{papoutsaki2016webgazer} & 2016 & $4.17^\circ$ & $>$30 clicks & Eye patch & Ridge regression \\
+    \textbf{Saccade (current)}                    & 2026 & ${\approx}2.2^\circ$ & 45 clicks & Eye patch & Ridge regression \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:comparison}
+\end{table}
+
+\begin{table}[H]
+  \centering
+  \caption{Pupil detection methods comparison. ``Rate'' = detection rate within 5 px on BioID or comparable benchmark. NIR = near-infrared camera preferred.}
+  \small
+  \begin{tabular}{llcccl}
+    \toprule
+    \textbf{Method} & \textbf{Year} & \textbf{Det. Rate} & \textbf{Speed} & \textbf{NIR?} & \textbf{Confidence} \\
+    \midrule
+    Timm \& Barth~\cite{timm2011accurate}   & 2011 & $>90\%$ & ${\sim}1$ ms  & No  & Implicit \\
+    Swirski et al.~\cite{swirski2012robust} & 2012 & ${\sim}80\%$ & ${\sim}5$ ms & Pref. & No \\
+    ExCuSe~\cite{fuhl2015excuse}             & 2015 & ${\sim}85\%$ & ${\sim}3$ ms & Pref. & No \\
+    ElSe~\cite{fuhl2016else}                 & 2016 & Best classical & ${\sim}3$ ms & Pref. & No \\
+    PuRe~\cite{santini2018pure}              & 2018 & $+10\%$ pp. vs. ElSe & ${\sim}5$ ms & Pref. & $\psi \in [0,1]$ \\
+    PuReST~\cite{santini2018purest}          & 2018 & $+5$--$30\%$ pp. & ${\sim}2$ ms & Pref. & Yes \\
+    RITnet~\cite{ritnet2019}                 & 2019 & ${\sim}95\%$ (seg.) & GPU req. & Optional & Seg. mask \\
+    EllSeg~\cite{ellseg2021}                 & 2021 & SOTA (seg.) & GPU req. & Optional & Seg. IoU \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Analysis of the Saccade Project}
+\label{sec:saccade}
+%% ============================================================
+
+\subsection{Where Saccade Stands}
+
+The Saccade project has achieved $142\,\text{px}$ (${\approx}2.2^\circ$) mean error.
+Comparing to Table~\ref{tab:comparison}, this is \textit{lower absolute error than WebGazer.js} and competitive with academic appearance-based methods on their per-user calibration results.
+
+However, the comparison requires careful interpretation:
+\begin{itemize}
+  \item Saccade is evaluated on a \textbf{single user, single session}, with 45 calibration clicks. This is an optimistic scenario.
+  \item MPIIGaze benchmarks evaluate \textbf{leave-one-out cross-subject} generalization: the model has never seen this person before.
+  \item Saccade's ridge regression inherently overfits to the current session and user.
+\end{itemize}
+A fairer comparison: FAZE with $k=9$ calibration samples achieves $3.88^\circ$ in a cross-subject setting using a powerful pretrained model. Saccade's $2.2^\circ$ on a single session with 45 samples is consistent with this trajectory.
+
+\subsection{Root Cause of Current Limitations}
+
+\begin{enumerate}
+  \item \textbf{No head-pose compensation.} The ridge regression uses raw (not normalized) eye patches. Any head movement changes the apparent eye appearance and shifts the regression estimate. This is the single largest source of error in real-world use.
+
+  \item \textbf{Illumination dependence.} The white-background trick (Experiment E10) improved accuracy by 12\% precisely because pupil contrast is critical for Timm and PuRe. Under normal conditions (dark backgrounds, varying ambient light), accuracy degrades.
+
+  \item \textbf{Session-specific model.} The ridge regression cannot be pretrained on external data and must be rebuilt each session. 45 clicks $\times$ 9 points is the minimum viable calibration.
+
+  \item \textbf{Low-dimensional features.} $10\times6$ eye patches (120-D after equalization) discard much appearance information. The best CNN models use $224\times224$ full-face crops.
+
+  \item \textbf{Kappa offset.} The physical angle between a person's optical axis (what the pupil center points toward) and their visual axis (what the fovea is aimed at) is $4$--$7^\circ$ and person-specific. Ridge regression partially compensates for this at calibration time, but head rotation changes how it manifests.
+\end{enumerate}
+
+\subsection{Why CNN-Based Experiments Failed (E3--E8)}
+
+The Saccade experiments reveal a systematic failure mode when using pretrained CNN gaze models (MobileOne-S0, ResNet-18, ResNet-50):
+\begin{itemize}
+  \item All pretrained models were trained on normalized data (ETH-XGaze or MPIIGaze with Zhang 2018 normalization).
+  \item Without correct Sugano normalization applied to the \textit{input}, the CNN receives incorrectly posed eye images and produces meaningless gaze angles.
+  \item The Saccade \texttt{src/sugano.rs} implementation had errors that produced catastrophic results (E8: $737\,\text{px}$, $5.14\times$ worse than the regression baseline).
+  \item Polynomial mappers (E4, E6) attempted to compensate for normalization errors but overfit on the small calibration set.
+\end{itemize}
+
+The lesson: pretrained gaze CNNs are highly sensitive to input normalization. Getting normalization exactly right (matching the training data preprocessing) is a prerequisite, not an optional optimization.
+
+%% ============================================================
+\section{Recommendations for the Saccade Project}
+\label{sec:recommendations}
+%% ============================================================
+
+Based on this survey, we recommend the following concrete improvements, ordered by expected impact-to-effort ratio:
+
+\subsection{Tier 1: Fix Sugano Normalization (Highest Impact, 1--2 Weeks)}
+
+Correctly implement the Zhang 2018 normalization (Sec.~\ref{sec:normalization}).
+Reference implementation: \url{https://github.com/xucong-zhang/data-preprocessing-gaze}.
+
+Steps:
+\begin{enumerate}
+  \item Add debug visualization: render the warped $448\times448$ eye crop to screen and verify it looks frontal.
+  \item Verify PnP pose estimation: project 3D face model back to image and check landmark alignment.
+  \item Match normalization parameters exactly to the training data of the chosen pretrained model.
+  \item Use \textbf{L2CS-Net}~\cite{abdelrahman2022l2cs} (ResNet-50, ONNX-exportable) or \textbf{GazeTR-Hybrid}: both are trained on ETH-XGaze with Zhang 2018 normalization, provide $3.5$--$4.0^\circ$ on MPIIGaze, and have public code.
+\end{enumerate}
+
+Expected outcome: ${\approx}250$--$300\,\text{px}$ without per-user calibration; ${\approx}150$--$200\,\text{px}$ with 9-sample per-user calibration (matching FAZE-level performance).
+
+\subsection{Tier 2: Few-Shot Personalization (Medium Impact, 2--3 Weeks)}
+
+After fixing normalization, add FAZE-style few-shot adaptation:
+\begin{enumerate}
+  \item Use a normalized CNN (from Tier 1) as the base model.
+  \item Fine-tune the last 1--2 layers on each user's calibration clicks (9--25 samples).
+  \item This corresponds to the ``user adaptation'' component of FAZE, implementable with Rust's tract-onnx for inference and a lightweight gradient update for the final layer.
+\end{enumerate}
+
+Expected outcome: ${\approx}100$--$150\,\text{px}$ ($1.5$--$2.5^\circ$) --- comparable or better than the current 45-click ridge regression, but more robust to head movement.
+
+\subsection{Tier 3: MediaPipe Face Mesh (Low Effort, Marginal Improvement)}
+
+Replace the PFLD 68-point landmark model with MediaPipe Face Mesh (468 landmarks).
+More landmarks improve PnP pose estimation accuracy, which in turn improves Sugano normalization quality.
+The ONNX version of MediaPipe BlazeFace+FaceMesh is available and tract-onnx compatible.
+
+Expected outcome: $5$--$10\%$ improvement in normalization accuracy; prerequisite for Tier 1.
+
+\subsection{Tier 4: Accumulate Cross-Session Data (Long Term)}
+
+Aggregate calibration data across sessions.
+Even with session-specific ridge regression, accumulated data from multiple sessions builds a user-specific model that improves over time.
+This is described in Saccade EXPERIMENTS.md as ``Option D'' and has no algorithmic cost.
+
+\subsection{What Not to Do}
+
+\begin{itemize}
+  \item \textbf{Do not use ResNet-50}: $<2\,\text{FPS}$ is unacceptable. MobileOne-S0 or a lightweight ResNet-18 trained on ETH-XGaze is the right balance.
+  \item \textbf{Do not retry smooth pursuit calibration} (Experiment E11 confirmed: $329\,\text{px}$, worse than point calibration). The literature also shows smooth pursuit calibration provides marginal benefit.
+  \item \textbf{Do not use OpenFace 2.0's geometric gaze}: $9.1^\circ$ is much worse than the current $2.2^\circ$.
+  \item \textbf{Do not apply PuRe to full-resolution RGB images} without NIR illumination: the false-positive edge rate is high and confidence estimates are unreliable.
+\end{itemize}
+
+%% ============================================================
+\section{Open-Source Repository Reference}
+\label{sec:repos}
+%% ============================================================
+
+\begin{table}[H]
+  \centering
+  \caption{Key open-source repositories for eye tracking.}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    \textbf{Project} & \textbf{URL} & \textbf{Language} \\
+    \midrule
+    WebGazer.js       & \url{https://github.com/brownhci/WebGazer}               & JavaScript \\
+    GazeCapture/iTracker & \url{https://github.com/CSAILVision/GazeCapture}       & PyTorch \\
+    RT-GENE           & \url{https://github.com/Tobias-Fischer/rt_gene}           & PyTorch/TF \\
+    GazeML (ELG)      & \url{https://github.com/swook/GazeML}                    & TensorFlow \\
+    FAZE              & \url{https://github.com/NVlabs/few_shot_gaze}             & PyTorch \\
+    Gaze360           & \url{https://github.com/erkil1452/gaze360}                & PyTorch \\
+    ETH-XGaze         & \url{https://github.com/xucong-zhang/ETH-XGaze}           & PyTorch \\
+    Data normalization & \url{https://github.com/xucong-zhang/data-preprocessing-gaze} & Python \\
+    L2CS-Net          & \url{https://github.com/Ahmednull/L2CS-Net}               & PyTorch \\
+    GazeTR            & \url{https://github.com/yihuacheng/GazeTR}                & PyTorch \\
+    GazeOnce          & \url{https://github.com/mf-zhang/GazeOnce}                & PyTorch \\
+    MPIIGaze PyTorch  & \url{https://github.com/hysts/pytorch_mpiigaze}           & PyTorch \\
+    PyPupilEXT        & \url{https://github.com/openPupil/PyPupilEXT}             & Python \\
+    Pupil Labs        & \url{https://github.com/pupil-labs/pupil}                 & Python/C++ \\
+    OpenFace 2.0      & \url{https://github.com/TadasBaltrusaitis/OpenFace}       & C++ \\
+    EVE               & \url{https://github.com/swook/EVE}                        & PyTorch \\
+    AFF-Net           & \url{https://github.com/vigil1917/AFF-Net}                & PyTorch \\
+    Awesome Gaze list & \url{https://github.com/cvlab-uob/Awesome-Gaze-Estimation}& Survey \\
+    GazeHub leaderboard & \url{https://phi-ai.buaa.edu.cn/Gazehub/}               & Web \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Diagnostic Analysis: Why the CNN Experiments Failed}
+\label{sec:diagnosis}
+%% ============================================================
+
+The research for this survey uncovered the \textit{precise root causes} of the Saccade CNN experiment failures (E3--E8), which we document here as a case study in common implementation pitfalls.
+
+\subsection{The Model Zoo Mismatch: Gaze360 vs ETH-XGaze Training}
+
+All three ONNX models in the Saccade repository (\texttt{mobileone\_s0\_gaze.onnx}, \texttt{resnet18\_gaze.onnx}, \texttt{resnet50\_gaze.onnx}) originate from the \textbf{yakhyo/gaze-estimation} repository~\cite{yakhyo_gaze}.
+They are \textit{L2CS-Net style} networks trained on the \textbf{Gaze360} dataset with standard ImageNet normalization~\cite{kellnhofer2019gaze360}:
+
+\begin{itemize}
+  \item Input: $448\times448\times3$ RGB, \textbf{plain face bounding-box crop}, normalized with ImageNet statistics (mean $= [0.485, 0.456, 0.406]$, std $= [0.229, 0.224, 0.225]$).
+  \item Output: Two 90-element softmax distributions (yaw bins and pitch bins, each covering $[-180^\circ, +180^\circ]$ at $4^\circ$ resolution).
+  \item \textbf{No Sugano/ETH-XGaze normalization was applied during training.}
+  \item Accuracy on Gaze360: $\approx12.6^\circ$ MAE (MobileOne-S0), $\approx12.8^\circ$ (ResNet-18) --- significantly below paper SOTA because Gaze360 is a hard dataset and these models are not the strongest architectures.
+\end{itemize}
+
+The ETH-XGaze-style normalization (focal\_norm$=960$, distance\_norm$=300\,\text{mm}$, $448\times448$) used in \texttt{src/sugano.rs} produces images that look \textit{completely different} from a plain face crop: the background geometry is perspective-warped, and the face is rotated to a canonical frontal pose. Feeding these warped images to a model trained on plain crops gives meaningless outputs.
+
+\subsection{Double-Wrong Inference in Experiment E8}
+
+The E8 code path (in \texttt{examples/webgazer\_cnn.rs}) committed two compounding errors:
+
+\begin{enumerate}
+  \item \textbf{Wrong input:} Called \texttt{run\_gaze\_from\_buffer(\&gaze\_net, \&normalized, 448, 448)} where \texttt{normalized} is the Sugano-warped 448×448 buffer. The yakhyo model expected a plain crop.
+  \item \textbf{Wrong output:} Applied \texttt{sugano::denormalize\_gaze(yaw\_n, pitch\_n, \&r\_norm)}, which pre-multiplies the gaze vector by $\mathbf{R}^T$. The yakhyo model already outputs angles in the camera frame (no normalization was applied during training), so this rotation was meaningless.
+\end{enumerate}
+
+The compound error produced a systematic misalignment on the order of $20$--$60^\circ$, which after polynomial calibration on only 9 calibration points collapsed to the catastrophic 737 px.
+
+Interestingly, the \texttt{run\_gaze} function (line 628 in the same file) implements the \textit{correct} pipeline for yakhyo models: plain bounding-box crop at $448\times448$ with ImageNet normalization. The output angle decoding (\texttt{bins\_to\_angle}) is also correct:
+\begin{equation}
+  \text{angle\_deg} = \sum_{i=0}^{89} \text{softmax}(\mathbf{o})_i \cdot (4i - 180).
+\end{equation}
+The bug was solely in the E8 experiment's decision to apply Sugano normalization and denormalization to a model that didn't use them.
+
+\subsection{Model--Normalization Compatibility Matrix}
+
+\begin{table}[H]
+  \centering
+  \caption{Required preprocessing for different gaze model families. Using the wrong normalization gives catastrophic results.}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    \textbf{Model / Source} & \textbf{Input preprocessing} & \textbf{Output format} & \textbf{Denormalize?} \\
+    \midrule
+    yakhyo/gaze-estimation & Plain 448×448 crop + ImageNet & 90-bin softmax (deg) & \textbf{No} \\
+    \quad (any backbone) & \texttt{mean=[.485,.456,.406]} & decode: $\sum i\cdot p_i \cdot 4 - 180$ & \\
+    \midrule
+    ETH-XGaze baseline~\cite{zhang2020ethxgaze} & Sugano-norm 224×224 + ImageNet & Scalar (pitch, yaw) rad & \textbf{Yes} (\cite{zhang2018revisiting}) \\
+    hysts/pytorch\_mpiigaze & Sugano-norm 224×224 + ImageNet & Scalar (pitch, yaw) rad & \textbf{Yes} \\
+    \midrule
+    FAZE DT-ED~\cite{park2019faze} & Sugano-norm 36×60 + normalize & Embedding → MLP → rad & \textbf{Yes} \\
+    \midrule
+    L2CS-Net (official)~\cite{abdelrahman2022l2cs} & 448×448 crop + ImageNet & 90-bin softmax (deg) & \textbf{No} \\
+    \midrule
+    OpenFace 2.0~\cite{baltrusaitis2018openface} & Raw image + landmark detection & Gaze vector (3D) & Geometric \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:compat}
+\end{table}
+
+\subsection{Accuracy of Existing yakhyo Models}
+
+A separate question is whether the yakhyo models, used correctly (plain crop, no Sugano), can improve on the current $142\,\text{px}$ ridge regression baseline.
+Given their $12.6^\circ$ Gaze360 MAE, the answer is almost certainly \textbf{no} --- even with a polynomial calibration.
+$12.6^\circ$ is $\approx 806\,\text{px}$ on a $2056$-pixel screen at 1° = 64 px, and calibration can only partially compensate for this noise.
+The fundamental problem is that Gaze360 training produces models that are accurate for the $360^\circ$ setting but perform poorly in the $\pm20^\circ$ desktop gaze range where sub-degree precision matters.
+
+The correct choice for a desktop system is a model trained specifically on \textbf{MPIIGaze or ETH-XGaze} (both use desktop/laptop setups).
+
+%% ============================================================
+\section{Algorithmic Ideas from Open-Source Libraries}
+\label{sec:oss_ideas}
+%% ============================================================
+
+This section summarises the most non-obvious algorithmic ideas discovered through
+source-code analysis of the six leading open-source eye tracking projects.
+Where file paths are given they refer to the respective GitHub repositories.
+
+\subsection{Pupil Labs: Detector 2D and Pye3D}
+
+\textbf{Histogram-spike thresholding} (\texttt{detect\_2d.hpp}).
+Instead of a fixed intensity threshold, a 256-bin intensity histogram of the ROI is computed
+per frame.
+The binary pupil mask is set at \texttt{lowest\_spike\_index + intensity\_range}, where
+``lowest spike index'' is the first histogram bin whose count exceeds a threshold (40 counts
+by default).
+The glint mask uses the symmetric top-end spike.
+This adapts automatically to varying illumination and iris colours
+without any session-specific tuning.
+Directly portable to Rust as a 256-counter histogram + scan.
+
+\textbf{True-support ellipse scoring} (\texttt{EllipseDistanceApproxCalculator.h}).
+For each candidate ellipse, count edge pixels within a narrow band
+($\epsilon_{\rm narrow}$) and a wide band ($\epsilon_{\rm wide}$) around the ellipse boundary.
+The confidence score is:
+\[
+  \psi = \left(\frac{N_{\rm narrow}}{N_{\rm wide}}\right)^k \cdot \frac{N_{\rm narrow}}{C}
+\]
+where $C$ is the ellipse circumference.
+This penalises both sparse and blurry edges and does not require a prior on pupil size.
+
+\textbf{Temporal prior fast path} (\texttt{detect\_2d.hpp}).
+When the previous frame had $\psi > 0.9$, the current frame skips
+the full combinatorial ellipse search and only refits edge pixels
+within $2\epsilon$ of the prior ellipse.
+This cuts per-frame cost from $\approx25\,\text{ms}$ to $\approx3\,\text{ms}$
+for steady-state tracking.
+
+\textbf{Dierkes-line 3D eye-sphere fitting} (\texttt{pye3d/eye\_model/base.py}).
+Each 2D pupil ellipse observation is unprojected to two candidate 3D circles.
+For each circle, a \emph{Dierkes line} is defined as:
+$\text{origin} = \text{circle\_center} - R_{\rm eye} \cdot \hat{n}$,\;
+$\text{direction} = \text{circle\_center}$.
+The eye sphere centre is the least-squares nearest point to all Dierkes lines:
+\[
+  \mathbf{c} = \left(\sum_i (I - \hat{v}_i\hat{v}_i^T)\right)^{-1}
+               \sum_i (I - \hat{v}_i\hat{v}_i^T)\,\mathbf{o}_i
+\]
+with Tikhonov regularisation pulling toward a prior position.
+The ambiguity between two candidate circles per observation is resolved by the sign of
+$\hat{g}_{2D} \cdot (\text{centre}_{2D} - \text{sphere}_{2D})$.
+Entire computation: 3$\times$3 pseudo-inverse --- microseconds in \texttt{nalgebra}.
+
+\textbf{Anti-symmetric boxcar blink detector} (\texttt{blink\_detection.py}).
+Maintains a rolling window of per-frame pupil confidence values $c_t \in [0,1]$.
+Applies the filter kernel $h = [+1/N,\ldots,+1/N,\,-1/N,\ldots,-1/N]$
+(sign-flip at the midpoint).
+Response $> 0.5$ signals blink onset; response $< -0.5$ signals offset.
+$O(N)$ per frame, zero extra allocation, directly portable to a \texttt{VecDeque<f32>}.
+
+\subsection{WebGazer.js: Post-2022 Rewrite}
+
+WebGazer completely replaced its legacy CLM face tracker with
+\textbf{MediaPipe FaceMesh} (468 3D landmarks via TensorFlow.js) in 2022.
+Eye patches are extracted by bounding box over specific arc landmark indices
+(\texttt{leftEyeUpper0}: 7 landmarks; \texttt{leftEyeLower0}: 9 landmarks).
+The patch is bilinearly resized to $10\times6$ pixels (60 features per eye, 120 total)
+and histogram-equalised (5-step subsampled equaliser).
+
+\textbf{Chronological decay weighting} (\texttt{ridgeWeightedReg.mjs}):
+the $i$-th oldest calibration sample receives weight
+$w_i = \sqrt{1 / (N - i)}$, so the most recent sample has weight 1.0
+and the oldest has weight $1/\sqrt{N}$.
+Equivalent to weighted least-squares: multiply both features and label by $w_i$ before
+solving the ridge system.
+In \texttt{nalgebra} this is a trivial per-row scale of the design matrix.
+
+\textbf{Post-prediction Kalman smoothing} (\texttt{util\_regression.js}):
+a 4-state constant-velocity filter
+$[\,x,\,y,\,\dot{x},\,\dot{y}\,]$ is applied as a final post-processing stage
+\emph{after} the ridge regression prediction.
+Measurement noise $R = 47I$ px.
+This is the only temporal smoothing in WebGazer; all heavy lifting is in the regression.
+
+\subsection{RT-GENE: Ensemble and Architecture}
+
+\textbf{4-model arithmetic mean ensemble} (\texttt{estimate\_gaze\_pytorch.py}):
+four ResNet-18 models are trained on different combinations of the MPIIGaze, UTMV, and
+RT-GENE training sets, then averaged: \texttt{result = torch.mean(stacked, dim=1)}.
+This alone yields a $22\%$ relative improvement over a single model on cross-dataset evaluation.
+
+\textbf{Headpose injection into the final FC layer}:
+the final network input is 514-dimensional:
+$[\underbrace{512}_{\text{binocular CNN}}\;|\;\underbrace{\theta_\text{head},\phi_\text{head}}_{2}]$.
+The two head-pose angles are concatenated \emph{directly} before the final linear layer,
+giving the network a clean signal to decompose total gaze into
+head direction + relative eye rotation.
+
+\textbf{Separate unshared CNN streams per eye}:
+unlike GazeCapture (which shares weights between eyes),
+RT-GENE uses independent ResNet-18 backbones for left and right eyes.
+This allows each stream to specialise on eye-asymmetric appearance features
+(iris movement direction, sclera exposure pattern, corner geometry).
+
+\subsection{L2CS-Net: Hybrid Classification--Regression Loss}
+
+\textbf{Exact combined loss} (\texttt{train.py}):
+\[
+  \mathcal{L} = \underbrace{\text{CE}(\ell_\phi, \hat{\phi}_{\rm bin}) +
+                             \text{CE}(\ell_\psi, \hat{\psi}_{\rm bin})}_{\text{classification}}
+              + \alpha\bigl[\underbrace{\text{MSE}(\phi_\text{pred}, \phi_\text{label}) +
+                             \text{MSE}(\psi_\text{pred}, \psi_\text{label})}_{\text{regression}}\bigr]
+\]
+with $\alpha=1$ and soft-argmax decoding
+$\phi_\text{pred} = \bigl(\sum_i \sigma(\ell_i) \cdot i\bigr)\cdot4 - 180^\circ$.
+The classification loss enforces that the correct bin has high probability (discrete regularisation);
+the regression loss pulls the expected value toward the exact angle even when the mode is correct.
+On Gaze360 this beats pure regression by $\approx0.4^\circ$.
+
+\subsection{GazeCapture / iTracker: Face-Grid Context}
+
+The \textbf{25×25 binary face grid} encodes the face bounding box position within the full
+camera frame (\texttt{faceGridFromFaceRect.m}).
+Given face bbox $(x, y, w, h)$ and frame $(W, H)$,
+cells where the scaled bbox overlaps a $25\times25$ grid are set to 1.
+Flattened to 625 values → $\text{FC}(625 \to 256 \to 128)$ → concatenated with eye features.
+
+This encodes: (a)~face-to-camera distance (from bbox size);
+(b)~horizontal/vertical position of the face on the screen-facing camera.
+Without this context, the model cannot distinguish whether the face is in the top-left
+corner (implying rightward downward gaze relative to the screen) or anywhere else.
+It is the primary mechanism enabling calibration-free gaze-to-screen mapping.
+
+\subsection{FAZE / DT-ED: Rotation-Equivariant Latent Gaze}
+
+The encoder disentangles three sub-codes:
+$z_\text{app}$ (identity), $z_\text{gaze}$ (shape: $d \times 3$, on a unit sphere),
+$z_\text{head}$ (shape: $d \times 3$, on a unit sphere).
+The equivariance property: rotating $z_\text{gaze}$ by a known head-pose rotation $R$
+produces a code that decodes to a new-viewpoint rendering of the same gaze direction.
+This means adaptation to a new person requires only fine-tuning a tiny 2-layer MLP
+$z_\text{gaze} \to \mathbb{R}^3$ (not the full backbone) on $k=3$--$9$ calibration samples via MAML.
+
+\subsection{opentrack: State Machine and Adaptive Kalman}
+
+\textbf{IoU-gated re-detection} (\texttt{ftnoir\_tracker\_neuralnet.cpp}):
+the slow full-frame detector ($\approx50\,\text{ms}$) is re-run only when
+IoU between the current tracking ROI and the last detection ROI drops below 0.25.
+Otherwise the existing ROI is fed directly to the pose estimator ($\approx5\,\text{ms}$).
+Latency reduction: $\approx10\times$ for typical frames.
+
+\textbf{Heteroscedastic UKF} (\texttt{unscented\_trafo.h}):
+the pose estimator outputs, alongside the pose estimate, a lower-triangular Cholesky factor
+of the measurement noise covariance.
+This is fed directly into the UKF $R$ matrix:
+uncertain frames (occlusion, blur, extreme pose) automatically down-weight measurement updates.
+
+\textbf{Deadzone filter} for fixation stability:
+a nonlinear filter that suppresses output motion below a tunable threshold
+(``deadzone hardness''), preventing sub-threshold oscillations from propagating to the cursor.
+
+\subsection{Consolidated Table of Ideas for Saccade}
+
+\begin{table}[H]
+\centering
+\caption{Open-source algorithmic ideas applicable to the Saccade project,
+ordered by cost-effectiveness.
+Difficulty 1/5 = hours, 5/5 = weeks.}
+\label{tab:ideas}
+\small
+\begin{tabular}{p{4.5cm}lcc}
+\hline
+\textbf{Idea} & \textbf{Origin} & \textbf{Expected gain} & \textbf{Difficulty} \\
+\hline
+Additive offset calibration & FAZE/general & 2--4° bias removal & 1/5 \\
+Chronological decay weights & WebGazer & 5--15\% LOO error & 1/5 \\
+Soft-argmax bin decoding & L2CS-Net & 0.4° & 1/5 \\
+Independent yaw/pitch heads & L2CS-Net & 0.2° & 1/5 \\
+Anti-symmetric blink filter & Pupil Labs & Removes bad cal. samples & 1/5 \\
+Histogram-spike threshold & Pupil Labs & Adaptive pupil detection & 2/5 \\
+Post-prediction Kalman & WebGazer & Smooth cursor & 2/5 \\
+RANSAC calibration filter & General & 30--40\% cal. error & 2/5 \\
+Face-grid context encoder & GazeCapture & Enables cal.-free & 2/5 \\
+200 ms settling delay & Literature & Fewer bad cal. pts & 2/5 \\
+IoU-gated re-detection & opentrack & 10× latency & 2/5 \\
+EWA ROI + deadzone & opentrack & Subjective jitter & 2/5 \\
+Velocity-adaptive Kalman & I-VT + Kalman & Fixation noise 50\% & 2/5 \\
+4-model arithmetic ensemble & RT-GENE & 22\% relative & 2/5 \\
+Head pose injection (FC) & RT-GENE & 0.5° & 3/5 \\
+Sugano normalization fix & ETH-XGaze & 1.0° (cross-person) & 3/5 \\
+MediaPipe Iris center & Ablavatski 2020 & PSA mitigation & 3/5 \\
+Dierkes-line 3D eye model & Pye3D & Online 3D model & 3/5 \\
+TPS calibration mapper & Literature & Edges coverage & 3/5 \\
+FAZE MetaSGD fine-tuning & FAZE & 3.18° total & 5/5 \\
+\hline
+\end{tabular}
+\end{table}
+
+%% ============================================================
+\section{Calibration Methods: Quantitative Analysis}
+\label{sec:calibration}
+%% ============================================================
+
+\subsection{How Many Calibration Points Are Needed?}
+
+The polynomial mapping $\text{screen}_{x,y} = f(\text{yaw}, \text{pitch})$ of degree 2 has 6 terms per axis (12 total).
+The minimum number of calibration points for a unique solution is 6.
+The question is how many are needed for good generalization.
+
+\textbf{Cerrolaza, Villanueva \& Cabeza (2012)}~\cite{cerrolaza2012polynomial} analyzed over 400\,000 mapping configurations.
+Key findings:
+\begin{itemize}
+  \item \textbf{5 points:} Adequate for corners + center, but leaves interpolation errors in mid-screen regions.
+  \item \textbf{9 points:} Good screen coverage; the practical optimum for desktop eye tracking. A 3×3 grid is the standard.
+  \item \textbf{14--23 points:} Marginal improvement ($\approx0.1^\circ$ better than 9-point in controlled settings).
+  \item \textbf{Beyond 23:} Diminishing returns; user burden outweighs accuracy gains.
+\end{itemize}
+
+\textbf{Kar \& Corcoran (2017)}~\cite{kar2017review} confirm that calibration accuracy does not increase significantly beyond 9 points for typical consumer applications.
+The Saccade project uses $9 \times 5 = 45$ samples (5 clicks per point), which is heavily over-determined ($7.5\times$) for a 6-parameter model; the additional samples provide noise averaging, not improved coverage.
+
+\subsection{Calibration Outlier Rejection}
+\label{subsec:outlier}
+
+A substantial fraction of calibration samples are corrupted by blinks, distraction,
+or transitional eye movements (post-saccadic glissades persist for 80--200\,ms).
+Three published mechanisms address this.
+
+\textbf{Settling delay (200\,ms).}
+WebGazer's validation plugin discards measurements within the first 500\,ms after a click.
+The physiology: a voluntary fixation shift triggers a saccade whose post-saccadic drift
+settles within $\approx200$\,ms.
+Collecting samples at the click moment captures transitional, not fixation, gaze.
+\emph{Saccade gap:} \texttt{calib\_state.rs::handle\_capture()} captures immediately at keypress.
+Adding a 200\,ms discard window is the single highest-ROI calibration improvement available.
+
+\textbf{Per-target spatial clustering.}
+After collecting $N$ samples at a target, compute the spatial median of the feature vectors.
+Reject samples whose L2 distance to the median exceeds $2\sigma$.
+The pattern is standard in IR-based systems (EyeLink, Tobii) and documented
+in Świrski \& Dodgson~\cite{swirski2014calibration} and Öney et al.~\cite{oney2022efficient}.
+Reduces calibration error by $\approx30$--$40\%$ in realistic deployment where users
+blink or glance away.
+
+\textbf{LOO-CV hat-matrix shortcut.}
+The standard LOO-CV implemented in \texttt{src/ridge.rs::loo\_error()} runs $N$ matrix
+inversions.
+For ridge regression there is a closed-form shortcut:
+\[
+  e_i^{\rm LOO} = \frac{y_i - \hat{y}_i}{1 - h_{ii}},
+  \qquad
+  H = X(X^T X + \lambda I)^{-1} X^T
+\]
+where $h_{ii}$ is the $i$-th diagonal of the hat matrix.
+This converts $O(Np^3)$ to $O(p^3 + n)$, enabling per-sample outlier detection on every
+new sample added: flag sample $i$ if $|e_i^{\rm LOO}| > 2\sigma_{e}$.
+
+\subsection{Pursuits Calibration}
+
+Vidal, Bulling \& Gellersen (2013)~\cite{vidal2013pursuits} proposed using smooth pursuit eye movements for implicit calibration.
+A moving target is shown; the pursuit reflex means the user is approximately fixating the target.
+Cross-correlation between eye velocity and target velocity gates which frames contribute calibration samples, rejecting saccades.
+
+\textbf{Results:}
+\begin{itemize}
+  \item Healthy adults, hardware trackers: $0.53^\circ$ (pursuits) vs $0.47^\circ$ (45-point explicit) --- statistically equivalent.
+  \item Difficult populations (ADHD, children): pursuits significantly better: $0.94^\circ$ vs $1.15^\circ$~\cite{nystrom2020pursuits}.
+\end{itemize}
+
+\textbf{Why Saccade's E11 failed.}
+Three factors combined:
+(1) \textbf{Fixed lag:} Smooth pursuit lag is $80$--$120\,\text{ms}$ and user-specific; the E11 implementation used a fixed $150\,\text{ms}$ correction.
+(2) \textbf{Buffer dilution:} The FIFO buffer holds 200 samples; pursuit frames ($\approx 10\times$ more than click frames) evicted the reliable click samples.
+(3) \textbf{No saccade filtering:} Catch-up saccades during pursuit inject high-error (gaze, target) pairs.
+
+A correct implementation requires: per-user lag estimation via cross-correlation, separate buffers for clicks and pursuit samples with different weights, and saccade rejection by comparing $|v_{\text{eye}} - v_{\text{target}}| < 30^\circ/\text{s}$.
+
+\subsection{Offset Calibration (One-Parameter Fix for CNN Models)}
+
+Chen et al. (WACV 2020)~\cite{chen2020offset} proposed a minimal calibration strategy for pretrained CNN gaze models:
+\begin{equation}
+  \hat{\mathbf{g}} = \text{CNN}(I) + \boldsymbol{\delta}_{\text{user}},
+\end{equation}
+where $\boldsymbol{\delta}_{\text{user}} = (\Delta\text{yaw}, \Delta\text{pitch})$ is a person-specific bias estimated as the mean residual across calibration samples:
+\begin{equation}
+  \boldsymbol{\delta}_{\text{user}} = \frac{1}{K}\sum_{k=1}^{K}\bigl(\mathbf{g}_{\text{target},k} - \text{CNN}(I_k)\bigr).
+\end{equation}
+This corrects for the kappa angle offset (the systematic per-person bias between optical axis and visual axis, $4$--$7^\circ$) using only 1--9 calibration samples.
+With $K=9$: approximately $3$--$4^\circ$ accuracy (better than zero-shot $4$--$5^\circ$, worse than FAZE's $3.18^\circ$).
+
+This is by far the simplest path to improving a CNN-based gaze model and requires only 20 lines of code. It is the recommended first step after getting a correct ETH-XGaze-trained model working.
+
+\subsection{Head Translation Compensation Without Sugano}
+
+When the user's head translates laterally by $\Delta x\,\text{mm}$ at distance $Z\,\text{mm}$, the apparent screen gaze position shifts by:
+\begin{equation}
+  \Delta\text{screen}_x \approx \frac{W_{\text{screen}}}{2} \cdot \frac{\Delta x_{\text{face\_px}}}{Z_{\text{px}}},
+\end{equation}
+where $\Delta x_{\text{face\_px}}$ is the change in face centroid pixel position and $Z_{\text{px}} = f \cdot W_{\text{face\_mm}} / W_{\text{face\_px}}$ is the estimated viewing distance in pixels.
+
+This \textit{parallax correction} can be applied directly to the ridge regression output without any changes to the regression model itself:
+\begin{equation}
+  \text{screen}_{x,\text{corrected}} = \text{screen}_{x,\text{predicted}} - \frac{W_{\text{screen}}}{2} \cdot \frac{(x_{\text{face}} - x_{\text{face,cal}})}{Z_{\text{face}}}.
+\end{equation}
+At 60 cm viewing distance, a 3 cm lateral head movement causes $\approx2.9^\circ$ ($\approx186\,\text{px}$) apparent gaze shift without this correction.
+Implementing this in \texttt{examples/webgazer.rs} requires tracking face position across frames (already available) and calibrating $x_{\text{face,cal}}$ and $Z_{\text{face,cal}}$ at the start of each session.
+
+%% ============================================================
+\section{Updated Recommendations}
+\label{sec:updated_rec}
+%% ============================================================
+
+Based on the diagnostic analysis in Section~\ref{sec:diagnosis} and calibration review in Section~\ref{sec:calibration}, we revise and sharpen the recommendations from Section~\ref{sec:recommendations}.
+
+\subsection{Immediate Fix (0 days): Use Existing Models Correctly}
+
+The yakhyo models (\texttt{resnet18\_gaze.onnx}, \texttt{mobileone\_s0\_gaze.onnx}) work correctly with the \texttt{run\_gaze} function (plain bounding-box crop, no Sugano normalization, no denormalization).
+The \texttt{run\_gaze\_from\_buffer} path introduced in E8 should be reverted to use \texttt{run\_gaze}.
+Expected result with polynomial calibration: $\approx250$--$350\,\text{px}$ --- worse than the current ridge regression, but a working baseline for the CNN path.
+
+\subsection{High-Impact Fix (1--3 days): Export ETH-XGaze Model}
+
+Export the pretrained ETH-XGaze ResNet-50 checkpoint (available from \url{https://github.com/xucong-zhang/ETH-XGaze}) to ONNX format.
+This model:
+\begin{itemize}
+  \item Was trained with correct Zhang 2018 normalization (matching \texttt{src/sugano.rs}).
+  \item Outputs scalar (pitch, yaw) in radians (no bin decoding needed).
+  \item Uses $224\times224$ input (update \texttt{FaceNormParams::ETH\_XGAZE} roi to $224\times224$).
+  \item Achieves $\approx4.5^\circ$ cross-person, $\approx3^\circ$ with offset calibration.
+\end{itemize}
+
+Export command:
+\begin{verbatim}
+python3 -c "
+import torch; from torchvision.models import resnet50
+ckpt = torch.load('xgaze_resnet50.pth', map_location='cpu')
+m = resnet50(); m.fc = torch.nn.Linear(2048, 2)
+m.load_state_dict(ckpt); m.eval()
+dummy = torch.zeros(1,3,224,224)
+torch.onnx.export(m, dummy, 'xgaze_resnet50.onnx',
+    input_names=['input'], output_names=['gaze'], opset_version=17)
+"
+\end{verbatim}
+
+Critical matching parameter: normalization input mean/std for ETH-XGaze is also ImageNet statistics, but the \textit{image} is the Sugano-normalized $224\times224$ face crop, not a plain bounding-box crop.
+
+\subsection{Visual Debugging Protocol for Sugano Normalization}
+
+The E8 failure could have been caught immediately with a visual debug tool.
+The following verification steps are mandatory before running any CNN experiment:
+
+\begin{enumerate}
+  \item \textbf{Render the warped crop:} Save the $448\times448$ (or $224\times224$) output of \texttt{normalize\_face} to a PNG. The face should appear frontal (eyes horizontal, no roll), even if the original image had head tilt. If the output looks distorted or rotated, the normalization rotation is wrong.
+
+  \item \textbf{Verify landmark reprojection:} After \texttt{solve\_pnp}, project the 3D face model back to 2D using the estimated $(R, t)$ and camera intrinsics. The reprojected points should overlap the detected landmarks within $\pm5\,\text{px}$.
+
+  \item \textbf{Test with known head pose:} Record a frame with the user facing directly forward (head pose $\approx$ identity). The Sugano rotation $\mathbf{R}_n$ should be close to identity; the warped crop should look nearly identical to the original face region.
+
+  \item \textbf{Sanity-check gaze output:} Without any calibration, have the user look at a known extreme point (top-left corner of screen). The CNN output should show negative yaw (leftward) and negative pitch (upward). If the sign is reversed, the angle convention does not match.
+\end{enumerate}
+
+\subsection{PnP Solver Quality}
+
+The current \texttt{solve\_pnp} in \texttt{src/sugano.rs} uses a simplified Procrustes approach that:
+\begin{itemize}
+  \item Back-projects 2D points onto a plane at $z = \text{const}$ (estimated from inter-eye distance).
+  \item Runs SVD-based rotation fitting in 2D (z components are zero in the observation matrix).
+  \item Does not minimize reprojection error iteratively.
+\end{itemize}
+
+This gives a rough rotation estimate sufficient for small head tilts but can fail significantly for pitch angles $>20^\circ$.
+Production implementations use iterative Levenberg-Marquardt PnP (OpenCV's \texttt{solvePnPRansac}) that minimizes the sum of squared reprojection errors. For Rust, the \texttt{cv} crate provides a \texttt{solve\_pnp} based on EPnP (Efficient Perspective-n-Point), which is a non-iterative but highly accurate analytical solution. Alternatively, implement Gauss-Newton iterations over the current Procrustes estimate: typically $\leq10$ iterations suffice.
+
+%% ============================================================
+\section{Systematic Survey of the Field (2020--2025)}
+\label{sec:surveys}
+%% ============================================================
+
+A growing body of \emph{meta-surveys} has attempted to unify the fragmented benchmarking landscape.
+This section reviews the most influential ones and synthesises their conclusions.
+
+\subsection{How the Field Surveys Itself: Key Review Papers}
+
+Before analysing individual methods, it is instructive to understand how the survey
+literature frames the field.
+
+\textbf{Kar \& Corcoran (2017) --- IEEE Access}~\cite{kar2017review}.
+The foundational consumer-platform survey.
+Dual-axis taxonomy: (a)~\emph{algorithm type} (NIR corneal-reflection, 3D geometric, appearance-based,
+cross-ratio, shape-based) $\times$ (b)~\emph{deployment platform} (desktop, TV, HMD, automotive, handheld).
+Key open problems identified: no standardised benchmarking; inconsistent accuracy metrics;
+lack of public datasets with ground-truth across realistic consumer scenarios.
+Proposed joint reporting of accuracy, precision, drift, head-motion robustness, and calibration cost.
+
+\textbf{Cheng et al.\ (2024) --- IEEE TPAMI}~\cite{cheng2024survey}.
+The definitive 2024 survey and benchmark.
+Reviews $150+$ papers (2015--2022) along four axes:
+(1)~input features (eye-only, face+eye, full face, multi-view);
+(2)~model design (supervised CNN, semi/self-supervised, multi-task, recurrent);
+(3)~calibration (none, few-shot, domain adaptation);
+(4)~platform (webcam, mobile, HMD).
+Central finding: prior comparisons are unfair because of differing preprocessing,
+output-space conventions, and gaze-origin definitions;
+re-evaluating all methods on common pipelines changes rankings substantially.
+Provides the GazeHub standardised toolkit (\url{https://phi-ai.buaa.edu.cn/Gazehub/}).
+
+\textbf{Ghosh et al.\ (2023) --- IEEE TPAMI}~\cite{ghosh2023gazesurvey}.
+Broader scope: covers gaze estimation plus gaze prediction, gaze following, gaze redirection (GAN),
+driver-zone classification, and visual attention in scenes.
+Architectures surveyed: CNN, RNN/LSTM, GAN, transformer, GNN, ensemble.
+Uniquely covers unsupervised and weakly supervised approaches.
+Open problems: partial faces and illumination extremes; few/zero-shot cross-person;
+privacy-preserving gaze analysis.
+
+\textbf{Kellnhofer et al.\ (2019) Gaze360}~\cite{kellnhofer2019gaze360}.
+Two-axis taxonomy: head-pose constraint (\emph{constrained} $\pm40^\circ$ vs.\ \emph{unconstrained} $360^\circ$)
+$\times$ subject-camera distance (\emph{near} vs.\ \emph{distant}).
+Gaze360 fills the unconstrained + distant cell (omni-directional rig, full-body to camera).
+Models trained on constrained datasets fail catastrophically on Gaze360.
+A 2024 re-evaluation~\cite{sikic2024reevaluation} confirmed: temporal models consistently
+outperform static ones; many MPIIGaze SOTA methods significantly underperform on Gaze360.
+
+\textbf{Standard evaluation protocols.}
+\begin{itemize}
+  \item \textbf{LOPO} (Leave-One-Person-Out): train on $N-1$ subjects, test on held-out. Used on MPIIGaze (15 subjects).
+  \item \textbf{Fixed split}: 80 subjects train / 30 subjects test. Used on ETH-XGaze.
+  \item \textbf{Cross-dataset}: train on one dataset, test on another, no target-domain labels.
+  \item \textbf{LOODO} (Leave-One-Dataset-Out): proposed by UniGaze~\cite{unigaze2025}
+        to measure generalisation over the full available benchmark collection.
+\end{itemize}
+The Zhang 2018 normalization~\cite{zhang2018revisiting} is now the universal
+preprocessing standard across all TPAMI-era appearance-based methods.
+
+\subsection{Cheng et al.\ (2024) --- A Unified Benchmark}
+
+Cheng et al.~\cite{cheng2024survey} evaluated 18 gaze-estimation models on six datasets under identical preprocessing and splits.
+Their four-axis evaluation framework measures: (i)~\textbf{accuracy} (mean angular error $^\circ$),
+(ii)~\textbf{cross-dataset generalisation}, (iii)~\textbf{computational cost}, and (iv)~\textbf{calibration sensitivity}.
+Key findings:
+\begin{itemize}
+  \item Appearance-based methods trained on ETH-XGaze and tested on MPIIFaceGaze achieve $\approx5.5$--$6.5^\circ$
+        \emph{without} any calibration.
+  \item Within-dataset performance ($3.5$--$4.0^\circ$) is $\approx30\%$ better than cross-dataset,
+        confirming that dataset-specific bias is a major unsolved problem.
+  \item Transformer-based models (GazeTR-Hybrid) are Pareto-optimal in the accuracy/cost plane.
+  \item Current peer-reviewed SOTA on MPIIFaceGaze is $\approx3.43^\circ$ (GazeTR-Hybrid);
+        adding 9-point person-specific calibration routinely yields $\approx3.0^\circ$.
+\end{itemize}
+
+\subsection{\v{S}iki\'{c} et al.\ (2024) --- A Critical Re-Evaluation}
+
+\v{S}iki\'{c} et al.~\cite{sikic2024reevaluation} challenged published numbers directly,
+re-running 12 methods under the same protocol and finding that $\approx60\%$ of published results
+\emph{could not be reproduced} to within 10\% relative error.
+Root causes identified:
+\begin{itemize}
+  \item \textbf{Train/test leakage}: several works evaluate on subsets of their own training
+        distribution without declaring it.
+  \item \textbf{Normalization inconsistency}: some papers normalise images before computing
+        $^\circ$ error, others do not; the difference is 0.3--0.8$^\circ$.
+  \item \textbf{Data-augmentation cherry-picking}: evaluation on augmented test sets inflates numbers.
+\end{itemize}
+The paper recommends that any new method report results under both \emph{within-dataset} and
+\emph{leave-one-person-out} (LOPO) protocols.
+
+\subsection{Zhang et al.\ (2025) --- Systematic Review of Gaze Personalisation}
+
+Zhang et al.~\cite{zhang2025systematic} focus specifically on calibration and personalisation methods,
+classifying them into three families:
+\begin{enumerate}
+  \item \textbf{Affine/offset correction} --- estimate $(\Delta\text{yaw}, \Delta\text{pitch})$ or a $2\times2$
+        linear transform from a small number of labelled gaze samples.
+        Simple, effective, $\approx3$--$4^\circ$ with 9 points.
+  \item \textbf{Feature-space adaptation} --- shift the CNN's internal feature distribution toward
+        the target person without fine-tuning all weights (e.g., AdaIN normalization layers).
+        Moderate complexity, $\approx3$--$3.5^\circ$.
+  \item \textbf{Full model fine-tuning} --- gradient descent on the last $k$ layers using
+        calibration samples; achieves $\approx2.5$--$3.0^\circ$ with 9--18 samples but requires
+        care to avoid catastrophic forgetting.
+\end{enumerate}
+
+%% ============================================================
+\section{Domain Adaptation and Cross-Dataset Generalisation}
+\label{sec:domain}
+%% ============================================================
+
+A persistent challenge in appearance-based gaze estimation is the large performance drop
+when a model trained on one dataset (e.g., ETH-XGaze) is tested on another (e.g., MPIIFaceGaze).
+This section surveys unsupervised domain adaptation (UDA) methods that address this gap.
+
+\subsection{Sources of Domain Gap}
+
+\begin{itemize}
+  \item \textbf{Illumination distribution}: studio-lit training vs.\ natural/screen illumination at test time.
+  \item \textbf{Camera resolution and FOV}: lab cameras at 5 MP vs.\ consumer webcams at 1--2 MP.
+  \item \textbf{Head pose distribution}: ETH-XGaze has extreme yaw/pitch coverage ($\pm90^\circ$);
+        MPIIFaceGaze is desk-use, mostly frontal.
+  \item \textbf{Gaze distribution bias}: different datasets have different marginal distributions
+        $p(\text{gaze})$ which leak into the model as prior bias.
+\end{itemize}
+
+\subsection{Representative Methods and Results}
+
+\begin{itemize}
+  \item \textbf{PureGaze}~\cite{cheng2022puregaze} --- disentangles appearance from gaze via
+        a \emph{gaze-irrelevant} generator branch trained adversarially.
+        ETH-XGaze $\to$ MPIIFaceGaze: $8.29^\circ$ (baseline ResNet-50: $\approx9.5^\circ$).
+
+  \item \textbf{RUDA}~\cite{bao2022ruda} --- applies residual domain adaptation modules (batch norm shift
+        + attention re-weighting) on top of a frozen backbone.
+        ETH-XGaze $\to$ MPIIFaceGaze: $6.50^\circ$.
+
+  \item \textbf{CRGA}~\cite{li2022crga} --- cross-referenced gaze adaptation; uses source--target
+        image pairs at similar head poses to align feature space.
+        Achieves $6.3^\circ$ cross-dataset.
+
+  \item \textbf{PnP-GA}~\cite{liu2021pnpga} --- plug-and-play generic domain adaptation; inserts
+        normalisation layers and a domain discriminator without modifying the backbone.
+        ETH-XGaze $\to$ MPIIFaceGaze: $7.41^\circ$.
+
+  \item \textbf{CauGE}~\cite{wang2022cauge} --- causal intervention via do-calculus to de-confound
+        background and illumination factors.
+        ETH-XGaze $\to$ MPIIFaceGaze: $6.92^\circ$.
+
+  \item \textbf{TPGaze}~\cite{cai2023tpgaze} --- temporal prototype alignment; builds person-level
+        prototypes from unlabelled target video and aligns them to source prototypes.
+        ETH-XGaze $\to$ MPIIFaceGaze: $5.96^\circ$.
+
+  \item \textbf{Alfa}~\cite{qin2024alfa} (AAAI 2026) --- attentive low-rank filter adaptation;
+        factorises backbone weights as $W + AB$ (rank-$r$ correction) and learns $A$, $B$
+        from unlabelled target data.
+        Average cross-domain $+$ personalisation: $\mathbf{5.72^\circ}$ --- current SOTA.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Cross-dataset gaze estimation: ETH-XGaze $\to$ MPIIFaceGaze (mean angular error, $^\circ$).
+Lower is better. $\dagger$ = with 9-point personalisation.}
+\label{tab:domain}
+\begin{tabular}{lcc}
+\hline
+\textbf{Method} & \textbf{Error ($^\circ$)} & \textbf{Notes} \\
+\hline
+No adaptation (ResNet-50) & $\approx9.5$ & baseline \\
+PnP-GA~\cite{liu2021pnpga} & 7.41 & plug-in UDA \\
+PureGaze~\cite{cheng2022puregaze} & 8.29 & adversarial \\
+CauGE~\cite{wang2022cauge} & 6.92 & causal \\
+RUDA~\cite{bao2022ruda} & 6.50 & residual shifts \\
+CRGA~\cite{li2022crga} & 6.30 & cross-ref pairs \\
+TPGaze~\cite{cai2023tpgaze} & 5.96 & temporal proto \\
+Alfa~\cite{qin2024alfa} & \textbf{5.72} & low-rank adapt. \\
+\hline
+ETH-XGaze model + 9-pt offset$^\dagger$ & $\approx3.5$ & with calibration \\
+\hline
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Takeaway for Saccade.}
+The 9-point calibration in Saccade is equivalent to an implicit domain adaptation:
+it shifts the model's output distribution to match this particular user.
+Implementing offset calibration~\cite{chen2020offset} on top of the ETH-XGaze backbone
+provides comparable benefit to full UDA with far less engineering overhead.
+
+%% ============================================================
+\section{Self-Supervised and Privacy-Preserving Gaze Estimation}
+\label{sec:selfsup}
+%% ============================================================
+
+Annotation of gaze data requires participants to look at known targets in calibrated setups,
+which is expensive and creates privacy concerns (eye movements reveal cognitive state, health indicators).
+Self-supervised and privacy-aware methods reduce or eliminate this requirement.
+
+\subsection{Self-Supervised Pre-Training}
+
+\textbf{UniGaze}~\cite{unigaze2025} applies masked autoencoders (MAE)~\cite{he2022mae} to
+Sugano-normalised face images. The encoder learns rich face-appearance features without gaze labels.
+Fine-tuning on a small labelled set achieves the best cross-dataset result to date:
+ETH-XGaze $\to$ MPIIFaceGaze: $5.57^\circ$.
+
+\textbf{GazeCLR}~\cite{gaze_clr2022} applies contrastive learning (MoCo-style) to eye images,
+using synthetic gaze-preserving augmentations to define positive pairs.
+Improves over supervised-only baseline by $+17.2\%$ relative in cross-person generalisation.
+
+\textbf{ST-ED}~\cite{park2020sted} (Self-Training with Elicited Data) generates pseudo-labels
+for unlabelled images using the teacher model, then distils back.
+Demonstrated for video-based scenarios where target-point annotations are unavailable.
+
+\subsection{Few-Sample Adaptation}
+
+\textbf{ELF-UA}~\cite{elfua2023} (Efficient Low-data Few-shot User Adaptation)
+achieves $4.8^\circ$ using only \textbf{5 unlabelled images} from the test user (not
+even requiring them to look at known targets).  The method estimates the user's kappa angle
+from pupil geometry alone and applies it as an offset.
+
+\subsection{Privacy-Preserving Gaze}
+
+\textbf{PrivatEyes}~\cite{biswas2021privateeyes} trains on synthetically generated eye
+images and uses a GAN-based domain randomisation to bridge the synthetic--real gap.
+Avoids storing real user images entirely.
+Performance: $6.8^\circ$ on MPIIFaceGaze (vs.\ $5.4^\circ$ for real-data-trained equivalent).
+
+%% ============================================================
+\section{Video-Based and Temporal Gaze Estimation}
+\label{sec:temporal}
+%% ============================================================
+
+Single-frame gaze estimation ignores the temporal structure of eye movements.
+Video-based methods exploit this to improve both accuracy and robustness.
+
+\subsection{EVE --- Fischer et al.\ (2020)}
+
+EVE~\cite{fischer2020eve} (ETH Video-based Eye Gaze Estimation) collects a large-scale
+video dataset with eye tracking ground truth and trains an LSTM-augmented CNN.
+Key result: $\mathbf{2.49^\circ}$ on the EVE test set --- significantly better than
+single-frame models trained on the same data ($3.1^\circ$), confirming that temporal
+context provides $\approx20\%$ relative improvement.
+
+\subsection{STAGE --- Liu et al.\ (2023)}
+
+STAGE~\cite{liu2023stage} (Spatio-Temporal Attention Gaze Estimation) adds a cross-frame
+attention module over a 16-frame window.
+It achieves $2.5\%$ improvement over GazeTR on MPIIFaceGaze and demonstrates that
+\emph{temporal attention} (not recurrence) is the key ingredient.
+
+\subsection{Practical LSTM Integration}
+
+Even a simple 2-layer LSTM operating on per-frame CNN features consistently yields
+$15$--$30\%$ relative improvement over single-frame baselines in within-session validation,
+primarily by suppressing per-frame noise without introducing noticeable lag at $\geq15$ fps.
+The main engineering cost is maintaining a frame buffer (e.g.\ 8--16 frames at 30 fps).
+
+\subsection{Relevance to Saccade}
+
+The current Saccade pipeline applies a 1\euro{} filter for post-hoc smoothing,
+which is equivalent to a causal low-pass filter.
+Replacing it with a 2-layer LSTM on the last 8 frames of CNN outputs (after offset calibration)
+could reduce jitter by $25$--$40\%$ without any changes to the calibration or model layers.
+
+%% ============================================================
+\section{Uncertainty Estimation in Gaze}
+\label{sec:uncertainty}
+%% ============================================================
+
+Gaze models produce point estimates ($\hat{\theta}$) but rarely communicate confidence.
+Uncertainty estimates are useful for: (i)~filtering unreliable frames before adding them to
+a calibration buffer, (ii)~providing a confidence-weighted cursor radius to the UI,
+and (iii)~detecting failures (eyes closed, extreme head pose, occlusion).
+
+\subsection{Pinball Loss (Gaze360)}
+
+Kellnhofer et al.~\cite{kellnhofer2019gaze360} introduce a \emph{pinball loss} variant that
+predicts a $95^\text{th}$ percentile interval around the point estimate.
+The interval half-width $\sigma$ directly estimates aleatoric uncertainty (caused by input noise).
+
+\subsection{SUGE --- Uncertainty-Guided Gaze Estimation (AAAI 2024)}
+
+SUGE~\cite{suge2024} propagates uncertainty through a normalizing-flow head,
+estimating both aleatoric and epistemic uncertainty.
+When frames with $\sigma > 1.5^\circ$ are discarded before calibration, mean error drops
+from $3.6^\circ$ to $3.1^\circ$ --- a $14\%$ improvement from uncertainty filtering alone.
+
+\subsection{Application to Saccade}
+
+A lightweight proxy for uncertainty in the existing ridge regression baseline:
+the 1D ridge residual $\|y - X\hat{\beta}\|_2$ on the leave-one-out split already tracks
+reliability.  Frames with high hold-out residuals during smooth pursuit (E11) are precisely
+the saccade and blink frames that contaminate the calibration buffer.
+Weighting calibration samples by $w_i = \exp(-r_i^2 / 2\sigma^2)$ (where $r_i$ is the
+residual) is a zero-cost improvement that requires no model changes.
+
+%% ============================================================
+\section{In-the-Wild Degradation Analysis}
+\label{sec:degradation}
+%% ============================================================
+
+Eye tracking performance degrades substantially in non-ideal conditions.
+Understanding the degradation sources helps prioritise engineering effort.
+
+\subsection{Eyeglasses}
+
+Glasses introduce specular reflections on the lens surface that partially obscure the iris.
+Quantified in~\cite{zhang2019mpiigaze}: wearing glasses increases mean error by
+$+0.5$--$1.0^\circ$ for appearance-based methods on MPIIFaceGaze.
+DL-based pupil segmentation methods are robust to moderate reflections but fail on
+anti-reflective coated lenses where the reflection pattern is irregular.
+\textbf{Mitigation:} UV polariser filter, or dataset augmentation with synthetic glints.
+
+\subsection{Low-Ambient-Light Conditions}
+
+Low-light increases shot noise, reduces iris--sclera contrast, and causes pupil dilation
+(which shifts the pupil centroid when using centre-of-mass estimation).
+Relative to well-lit conditions, errors increase $+40$--$68\%$ in controlled experiments.
+\textbf{The white-background hack (Saccade E10)} addresses exactly this: the bright screen
+provides fill-light, keeping the face well-exposed and pupils moderately constricted.
+This is a special case of the general principle: IR illumination (940 nm) is the gold
+standard in hardware eye trackers because it provides stable, viewer-invisible illumination.
+
+\subsection{Distance from Screen}
+
+MPIIFaceGaze training distance is $45$--$85$ cm.
+At 90 cm, angular extent of eye features decreases, degrading landmark quality.
+Sugano normalization addresses this by warping to a canonical distance (600 mm),
+which is why it is important to match the normalization parameters exactly to the model's
+training setup (see Section~\ref{sec:diag}).
+
+\subsection{Motion Blur}
+
+Fast head movement introduces motion blur that degrades PFLD landmark quality.
+For users with involuntary head tremor (e.g.\ Parkinson's), mean error doubles.
+\textbf{Mitigation:} shutter speed $\leq4$ ms (usually auto on modern webcams at $\geq60$ fps).
+
+%% ============================================================
+\section{Facial Landmark Detectors: A Comparison}
+\label{sec:landmarks}
+%% ============================================================
+
+The quality of facial landmark detection determines PnP head-pose accuracy, eye ROI extraction,
+and the reliability of any geometric gaze correction.
+Table~\ref{tab:landmarks} compares the detectors relevant to the Saccade project.
+
+\begin{table}[h]
+\centering
+\caption{Comparison of facial landmark detectors relevant to gaze tracking.
+NME = normalised mean error on 300W (\%, lower is better).
+Speed measured on CPU (single thread, 640$\times$480 input).}
+\label{tab:landmarks}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Detector} & \textbf{Points} & \textbf{NME 300W} & \textbf{CPU fps} & \textbf{Notes} \\
+\hline
+PFLD~\cite{guo2019pfld} & 68 & 2.82\% & 40--60 & Current Saccade \\
+MediaPipe Face Mesh & 468 & $\approx$1.8\% & 25--35 & Cross-platform, WASM \\
+3DDFA\_V2~\cite{guo20203ddfa} & 68+3D & 2.62\% & 30--40 & Outputs 3DMM coefficients \\
+SPIGA~\cite{prados2022spiga} & 68 & \textbf{1.31\%} & 8--12 & Best accuracy, heavy \\
+OpenFace 2.0~\cite{baltrusaitis2018openface} & 68 & 1.8\% & 10--15 & Also outputs AU + head pose \\
+\hline
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Key observations:}
+\begin{itemize}
+  \item PFLD (current Saccade) is fast but has the highest NME.
+        For the ridge regression baseline, this is adequate because small errors in eye corners
+        only slightly affect the 10$\times$6 patch extraction.
+  \item MediaPipe Face Mesh offers a $36\%$ NME improvement and provides $468$ landmarks
+        including dense eye contour and iris centre --- useful for both PnP and pupil tracking.
+        ONNX export is available and inference can run at $25$+ fps on CPU.
+  \item 3DDFA\_V2 directly outputs 3DMM (3D morphable model) coefficients, which gives a
+        richer face model for PnP.  Recommended if Sugano normalization is to be made robust.
+  \item SPIGA achieves best accuracy but is too slow for real-time use on CPU.
+\end{itemize}
+
+\noindent\textbf{Recommendation for Saccade.}
+Replacing PFLD with MediaPipe Face Mesh (ONNX) is a 2--3 day effort that would:
+(i) improve PnP head-pose accuracy by $\approx36\%$;
+(ii) provide iris centre estimates as a free by-product (potentially replacing the patch-based eye extraction);
+(iii) remain real-time on CPU.
+
+%% ============================================================
+\section{Eye Tracking on Consumer Laptops: MacBook Case Study}
+\label{sec:macbook}
+%% ============================================================
+
+Webcam-based gaze estimation on a laptop is a substantially harder problem than
+the same task in a controlled laboratory.
+This section analyses the specific constraints of the MacBook FaceTime camera,
+quantifies the sources of error that do not appear in published benchmarks,
+and provides concrete engineering remedies.
+
+\subsection{Camera Hardware Characteristics}
+
+\textbf{Sensor and resolution.}
+Pre-2021 MacBooks ship with a 720p FaceTime HD sensor; MacBook Air M2 (2022) and
+MacBook Pro 14/16 (2021+) upgraded to 1080p.
+Despite the resolution bump, Apple does not publish sensor size, pixel pitch,
+or optical FOV figures.
+
+\textbf{Rolling shutter.}
+All FaceTime cameras use CMOS rolling-shutter readout: rows are scanned sequentially
+rather than all at once.
+During a fast saccade (peak velocity $400$--$600\,^\circ$/s), the eye traverses
+several degrees while rows are still being scanned, smearing the pupil boundary
+across $\approx5$--$10$ pixel rows at 30 fps.
+The effect is worst for the PuRe / Swirski ellipse-fitting pipeline
+(which relies on a clean limbus edge) and negligible for the patch-based
+ridge-regression baseline used in Saccade.
+
+\textbf{IR cut filter.}
+Consumer webcams incorporate an IR-cut filter with a cutoff at $\approx650$--$700$ nm,
+giving negligible sensitivity at the 850 nm and 940 nm wavelengths used by dedicated
+IR-LED gaze trackers.
+Pupil detection on FaceTime cameras must rely on visible-light iris--sclera contrast,
+which is significantly weaker under ambient illumination variation.
+This is why the white-background trick (Saccade E10) provides such a large gain:
+the screen acts as a controlled wideband fill-light, maximising visible-spectrum
+pupil contrast.
+
+\textbf{Automatic exposure and white balance (AE/AWB).}
+macOS continuously adjusts gain, shutter speed, and colour balance frame-to-frame.
+This creates luminance and chrominance drift that corrupts iris detection across frames
+and invalidates feature statistics built up during a session.
+\textbf{Fix (AVFoundation):}
+\begin{enumerate}
+  \item \texttt{device.lockForConfiguration()}
+  \item \texttt{device.exposureMode = .custom} then \texttt{setExposureModeCustom(duration:iso:)}
+        (lock at a shutter speed that is a multiple of the display refresh period ---
+        see Section~\ref{subsec:pwm})
+  \item \texttt{device.whiteBalanceMode = .locked} then \texttt{setWhiteBalanceModeLocked(with:)}
+  \item \texttt{device.focusMode = .locked}
+  \item \texttt{device.unlockForConfiguration()}
+\end{enumerate}
+AVFoundation's completion handlers deliver \texttt{CMTime} timestamps marking the first
+frame that reflects each change, enabling precise temporal synchronisation of parameter
+transitions with gaze labels.
+
+\textbf{Center Stage.}
+MacBook Pro models (M3 and later) support Center Stage, which uses an ultrawide sensor
+($\approx120^\circ$ FOV) and dynamically crops/zooms a $1080$p window to keep the face centred.
+This changing crop invalidates any fixed calibration.
+Disable it programmatically:
+\texttt{AVCaptureDevice.centerStageEnabled = false} and
+\texttt{AVCaptureDevice.centerStageControlMode = .app}.
+
+\textbf{Frame rate pinning.}
+Without explicit constraints, the ISP drops to 15 fps in dim conditions:
+\begin{quote}
+\texttt{device.activeVideoMinFrameDuration = CMTimeMake(1, 30)}\\
+\texttt{device.activeVideoMaxFrameDuration = CMTimeMake(1, 30)}
+\end{quote}
+
+\subsection{Camera-to-Screen Parallax}
+\label{subsec:parallax}
+
+The FaceTime camera sits in the top bezel, $\approx12$--$20$ mm above the top edge
+of the screen.
+At a typical laptop viewing distance of 50 cm, this introduces a systematic angular offset:
+\begin{equation}
+  \delta\theta = \arctan\!\left(\frac{d_{\rm cam}}{D}\right)
+\end{equation}
+where $d_{\rm cam}$ is the camera-to-screen-centre vertical distance and $D$ is the
+eye-to-screen distance.
+For a MacBook Air M2 ($d_{\rm cam} \approx 95$ mm, screen centre below camera optical axis):
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+\textbf{Distance} & $D=35$ cm & $D=50$ cm & $D=70$ cm \\
+\hline
+Parallax offset & $\approx2.4^\circ$ & $\approx1.7^\circ$ & $\approx1.2^\circ$ \\
+At 1°$\approx$64 px & $\approx153$ px & $\approx109$ px & $\approx77$ px \\
+\hline
+\end{tabular}
+\end{center}
+
+This offset is \emph{larger than the mean error of Saccade's best method (142 px)}.
+It appears as a systematic downward bias: the user fixates the bottom of the screen,
+but the camera sees them looking slightly higher.
+Because the offset is corrected out by the per-user click calibration, it does not
+inflate calibration error \emph{within} a session — but it means any shift in
+viewing distance between calibration and use directly causes drift.
+
+The parallax is not a scalar constant: it has both a vertical and a horizontal
+component when the user's head is off-centre horizontally.
+Proper correction requires knowing the 3D head position and the rigid transform
+between camera centre and screen, as formalised in
+the ETRA 2021 paper on parallax correction for 3D eye tracking~\cite{crane2021parallax}.
+MediaPipe Face Mesh provides the iris landmarks needed to compute this correction
+in real time.
+
+\subsection{Screen-as-Light-Source Effects}
+\label{subsec:screenlight}
+
+\textbf{Non-uniform and dynamic illumination.}
+The display is the dominant light source in typical laptop use.
+Bright content in one screen corner illuminates the ipsilateral face side with
+a lighting ratio that can exceed $4{:}1$ across the face.
+Rapid content changes (scrolling, video playback) vary the illumination frame-to-frame,
+creating feature-vector drift that has no equivalent in lab-collected training data.
+This is the single largest confound \emph{not} captured by MPIIGaze, ETH-XGaze,
+or any existing benchmark dataset.
+
+\textbf{PWM backlight banding.}
+\label{subsec:pwm}
+LCD and OLED displays use pulse-width modulation (PWM) to dim the backlight at
+60--250 Hz.
+When the camera shutter period does not evenly divide the PWM period,
+rolling-shutter readout captures some rows during LED-on and others during LED-off,
+producing horizontal luminance bands across the face image.
+\textbf{Fix:} lock shutter speed to a multiple of the display refresh period
+(e.g.\ $1/60$ s on a 60 Hz display).
+
+\textbf{Pupil size artefact (PSA).}
+PSA was first described theoretically by Wyatt (1995) and first measured empirically by
+Wyatt (2010)~\cite{wyatt2010pupil} using a dark-pupil video tracker on 7 participants:
+mean PSA $0.81^\circ$, maximum $1.22^\circ$.
+Drewes et al.~\cite{drewes2014psa} provided the definitive large-scale quantification
+($N=39$, EyeLink 1000):
+mean $\mathbf{2.55^\circ}$, range $0.3$--$5.2^\circ$, peak drift velocity $8.4^\circ$/s.
+PSA was present in \emph{every single subject} without exception.
+For reading tasks on a laptop screen, horizontal PSA $\approx0.39$--$0.64^\circ$
+($\approx3$--4 characters) and vertical PSA $\approx0.24$--$1.03^\circ$~\cite{psa2024}.
+
+The PSA magnitude scales directly with pupil dilation:
+horizontal slope $\approx0.38^\circ$/mm, vertical up to $0.86^\circ$/mm~\cite{hooge2021psa}.
+Darker screen backgrounds cause larger pupils, larger PSA, and thus worse accuracy ---
+exactly explaining the Saccade E10 finding (white background: $161\to142\,\text{px}$).
+The optimal PSA compensation identified by Drewes et al.\ is a \emph{look-up table}
+built from a bright + dark background calibration sequence, reducing residual drift
+to $26\%$ of baseline ($74\%$ compensation).
+
+The iris--sclera boundary (limbus) has \emph{constant} diameter ($11.7\pm0.5\,\text{mm}$)
+regardless of pupil dilation.
+Tracking the iris contour rather than the pupil centre is therefore the fundamental
+PSA mitigation strategy~\cite{irissometry2022}.
+\textbf{MediaPipe Iris}~\cite{ablavatski2020mediapipe} provides exactly this:
+5 landmarks per eye (1 centre + 4 contour points at the iris boundary, global indices 468--477
+in FaceMesh output).
+The centre landmark is derived from the iris contour and is more stable than a raw
+pupil centroid under dilation, though no published paper has yet quantified the PSA
+reduction specifically for webcam gaze regression.
+
+\textbf{Blue-light iris contrast.}
+LCD screens emit predominantly in narrow phosphor bands around 450 nm (blue).
+At high luminance, blue light reduces contrast between iris and sclera for
+blue/grey irises and causes periocular glare artefacts.
+IR trackers avoid this entirely by operating at 850--940 nm where screen emission
+is near zero.
+
+\subsection{Illumination Compensation Algorithms}
+
+\textbf{CLAHE} (Contrast-Limited Adaptive Histogram Equalisation) applied tile-wise
+to the grayscale face crop compensates for spatially non-uniform illumination in
+real time ($30$+ fps on CPU for $200\times200$ px crops via OpenCV's \texttt{createCLAHE}).
+Pairing it with a single-scale Retinex pre-pass (which separates illumination from
+reflectance in log space) improves iris detection under side-lit
+conditions~\cite{hamid2014retinex}.
+
+\textbf{Screen-content-aware irradiance prediction.}
+The laptop device has direct access to its own screen framebuffer
+(\texttt{CGDisplayCreateImageForRect} / Metal on macOS).
+A pre-computed \emph{irradiance transfer matrix} $T \in \mathbb{R}^{F \times P}$
+encodes how each screen pixel $p$ contributes to each face-image pixel $f$,
+estimated offline using a known face model and display geometry.
+At runtime, the predicted face illumination is $\ell = T \cdot s$
+(where $s$ is the downsampled screen content vector), and a polynomial
+illumination model can be subtracted before feature extraction.
+
+\textbf{HiFiGaze}~\cite{hifigaze2025} (Kim et al., ACM CHI 2026, arXiv:2603.19588)
+is the most complete realisation of screen-content-aware gaze.
+Architecture: MobileNetV4 backbone on $500\times250\,\text{px}$ eye crops (1280-d embedding)
+fused with: (a)~a $50\times101$ Gaussian-blurred screen thumbnail;
+(b)~a correlation heatmap of the thumbnail convolved over the iris region;
+(c)~a normalised 2D vector from iris centre to the detected screen reflection.
+Tested on iPhone~14 Pro Max ($4\text{K}$ front camera), $N=22$ participants,
+LOSO protocol, no per-user calibration:
+
+\begin{center}
+\begin{tabular}{lc}
+\hline
+\textbf{Variant} & \textbf{Mean error (cm)} \\
+\hline
+Eye crops only (baseline) & 2.00 \\
++ Screen thumbnail & 1.77 ($-12\%$) \\
++ Reflection vector (best) & \textbf{1.64} ($-18\%$) \\
+\hline
+\end{tabular}
+\end{center}
+
+Precursor: \textbf{ScreenGlint}~\cite{screenglint2017} (CHI 2017) first demonstrated
+screen-glint gaze on a smartphone, achieving $2.44^\circ$ without head pose variation,
+but required essentially white/uniform screen content for reliable glint detection ---
+the problem HiFiGaze solves by matching glint to known screen content.
+The approach is applicable on MacBook via \texttt{CGDisplayCreateImageForRect} / Metal
+to read the framebuffer in real time.
+
+\subsection{iPhone / iPad as Gaze Tracker: ARKit and TrueDepth}
+\label{subsec:arkit}
+
+\textbf{ARKit \texttt{lookAtPoint}} returns the 3D convergence point of left and right
+gaze rays in face-coordinate space.
+Published accuracy on an iPhone (uncalibrated, LOSO):
+\begin{itemize}
+  \item Greinacher \& Voigt-Antons (HCII 2020)~\cite{greinacher2020arkit}:
+        $\mathbf{3.18^\circ}$ / $1.44\,\text{cm}$ on screen, $N=9$, 60 fps.
+  \item Arakawa et al.\ (ICMI 2022)~\cite{arakawa2022rgbd}:
+        $\mathbf{6.38\,\text{cm}}$ Euclidean screen error --- the raw projection
+        amplifies angular errors at typical distances.
+\end{itemize}
+
+\textbf{TrueDepth depth map (accessible).}
+The $640\times480$ depth map is available to third-party apps via
+\texttt{AVCaptureDepthDataOutput} (\texttt{AVDepthData}).
+\textbf{RGBDGaze}~\cite{arakawa2022rgbd} feeds this depth channel alongside RGB into a CNN,
+reducing screen gaze error from $2.77\,\text{cm}$ (iTracker, RGB only) to
+$\mathbf{1.89\,\text{cm}}$ on the same device --- the depth provides better
+face geometry estimates for head-pose compensation.
+
+\textbf{TrueDepth IR flood image (not accessible).}
+The raw IR flood-illuminated image (which would enable IR PCCR tracking)
+is not exposed through any public AVFoundation API.
+Only the derived depth map and \texttt{ARFaceAnchor} outputs are available to third-party apps.
+
+\textbf{iOS 18 Eye Tracking} (shipped September 2024) uses the standard wide front camera
+and on-device ML; Apple has published no accuracy number.
+It is an accessibility pointer-control feature with no API for data access.
+
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+\textbf{Method} & \textbf{Error} & \textbf{Camera} \\
+\hline
+ARKit \texttt{lookAtPoint} (raw) & 3.18° / 6.38 cm & TrueDepth \\
+iTracker (RGB only) & 2.77 cm & Front RGB \\
+RGBDGaze (RGB + depth) & \textbf{1.89 cm} & TrueDepth \\
+HiFiGaze (RGB + screen) & \textbf{1.64 cm} & 4K front RGB \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Hardware Alternatives on a MacBook}
+
+When the built-in webcam accuracy ceiling is insufficient, the following options
+attach via USB without requiring a dedicated monitor:
+
+\begin{itemize}
+  \item \textbf{Tobii Eye Tracker 5.} Clip-on USB, 33 Hz, IR LEDs + stereo cameras.
+        Validated accuracy $\approx1^\circ$ ($\approx30$ px on 1080p at typical distance)~\cite{tobii5eval}.
+        Uses IR illumination and PCCR; completely bypasses visible-light contrast limitations.
+  \item \textbf{Gazepoint GP3 HD.} USB, 150 Hz, NIR camera without active LEDs.
+        Peer-reviewed validation confirms accuracy and precision comparable to Tobii
+        for fixation extraction~\cite{gazepoint2022}.
+  \item \textbf{iPhone as Continuity Camera.} macOS Ventura+ exposes the iPhone as
+        a webcam via AVFoundation.
+        iPhone 12+ provides a 12 MP front camera vs.\ MacBook's 1080p equivalent.
+        The iPhone X--15 Pro TrueDepth module (30,000-point structured light at 940 nm)
+        is not yet exposed for third-party gaze tracking via AVFoundation, but would
+        enable high-quality PCCR if accessed through ARKit's \texttt{ARFaceAnchor.lookAtPoint}.
+\end{itemize}
+
+\subsection{Practical Recommendations for Saccade on MacBook}
+
+In priority order, zero to three days of effort:
+
+\begin{enumerate}
+  \item \textbf{Lock camera parameters} (1 hour).
+        Add \texttt{AVCaptureDevice.lockForConfiguration()} with fixed exposure,
+        white balance, and focus at session start.
+        Lock shutter to 1/60 s to eliminate PWM banding on 60 Hz displays.
+        Expected gain: reduced frame-to-frame feature drift, $\approx5$--$10\%$ fewer
+        outlier calibration samples.
+
+  \item \textbf{Apply CLAHE per frame} ($\frac{1}{2}$ day).
+        Equalise each eye patch independently before ridge regression.
+        The histogram-equalisation step already in WebGazer only uses global statistics;
+        CLAHE is tile-based and better for asymmetric screen illumination.
+        Expected gain: $5$--$15\%$ error reduction under non-uniform lighting.
+
+  \item \textbf{Geometric parallax correction} (1 day).
+        Given known camera position ($d_{\rm cam}$) and estimated face depth from
+        inter-pupillary distance, apply Equation~(1) as a per-frame post-correction to
+        the ridge regression output.
+        Particularly important for users who move the laptop between calibration and use.
+
+  \item \textbf{Screen-content luminance predictor} (2--3 days).
+        Compute mean screen luminance per quadrant at each frame and use it to weight
+        or normalise the corresponding eye-patch features.
+        This is a coarse version of the HiFiGaze irradiance transfer approach but
+        requires no calibration hardware.
+
+  \item \textbf{MediaPipe Face Mesh for iris tracking} (2--3 days).
+        MediaPipe provides sub-pixel iris centre estimates as part of its 468-landmark model.
+        Using these in place of centre-of-mass pupil detection would eliminate PSA-related
+        drift (iris centre is stable under pupil dilation, unlike a pupil centroid).
+\end{enumerate}
+
+%% ============================================================
+%% ============================================================
+\section{Evaluation Methodology and Accuracy of the Saccade System}
+\label{sec:evaluation}
+%% ============================================================
+
+Evaluating a webcam gaze tracker without dedicated hardware ground truth is non-trivial.
+This section clarifies the metrics used in this project and their relation to published benchmarks.
+
+\subsection{Click-Based Validation (Our Protocol)}
+
+The calibration and validation loops in \texttt{examples/webgazer.rs} use \textit{click-based labels}: the user clicks on a visible dot, and we record the gaze prediction at click time alongside the dot's screen position.
+This is identical to WebGazer.js's evaluation methodology~\cite{papoutsaki2016webgazer}.
+
+Two variants have been run:
+
+\begin{itemize}
+  \item \textbf{In-distribution (single-point).} Validation at one position (screen center) after calibration on 9 points including center. The model has seen center-region samples during calibration. Result: \textbf{142\,px} ($\approx 2.2^\circ$).
+  \item \textbf{Multi-point out-of-distribution.} Validation at 5 positions distinct from the 25-point calibration grid. Result: \textbf{237\,px} ($\approx 3.7^\circ$), measured via offline replay on a saved session (\texttt{saccade\_session.bin}, \texttt{examples/replay.rs}).
+\end{itemize}
+
+The multi-point figure is the more reliable estimate of real-world accuracy.
+The gap between 142\,px and 237\,px illustrates how easy it is to report optimistic numbers by validating in-distribution.
+
+\subsection{Methodological Gap vs.\ Published Benchmarks}
+
+Published numbers (MPIIGaze protocol) differ in three fundamental ways:
+
+\begin{enumerate}
+  \item \textbf{Ground truth.} Datasets use programmatically verified fixation labels (subject gazes at a dot that appears at a known screen location, confirmed by a reference eye tracker or gaze-contingent display). Click labels conflate gaze position with motor noise ($\pm 10$--$30$\,px from cursor aim) and assume the eye is exactly on the cursor at click time.
+
+  \item \textbf{Cross-subject generalization.} SOTA numbers are \textit{cross-subject}: train on subjects 1--14, test on subject 15, rotate. Our result is \textit{within-subject}: calibrate and validate on the same person. A calibrated within-subject number is always lower than a cross-subject one for any method.
+
+  \item \textbf{Head movement.} MPIIGaze was collected over months in natural laptop use with free head movement. Our sessions are short ($<5$\,min) and the head is relatively still. Head-pose variation is the hardest generalization axis for appearance-based methods.
+\end{enumerate}
+
+Table~\ref{tab:eval_comparison} summarizes the comparison.
+
+\begin{table}[H]
+\centering
+\caption{Accuracy comparison: Saccade vs.\ published systems. Numbers in the same column share the same protocol and are directly comparable; numbers across columns are \textbf{not}.}
+\label{tab:eval_comparison}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{System} & \textbf{Click (in-dist.)} & \textbf{Click (OOD)} & \textbf{MPIIGaze} & \textbf{Calibration} \\
+\midrule
+Saccade (this work) & \textbf{142\,px / 2.2°} & \textbf{237\,px / 3.7°} & not tested & 50 clicks \\
+WebGazer.js~\cite{papoutsaki2016webgazer} & $\approx$175\,px / 4° & — & — & implicit clicks \\
+L2CS-Net~\cite{abdelrahman2022l2cs} & — & — & 3.92° & none \\
+FAZE~\cite{park2019faze} & — & — & 3.18° & 9 points \\
+GazeTR-Hybrid~\cite{cheng2022gazetr} & — & — & 3.43° & none \\
+Tobii (hardware ref.) & — & — & $\approx$0.5° & built-in \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Path to an Honest Benchmark}
+
+To produce a number directly comparable to literature, the following protocol should be implemented (see also issue~\#49 in the project repository):
+
+\begin{enumerate}
+  \item Download \textbf{MPIIFaceGaze}~\cite{zhang2019mpiigaze} (15 subjects, laptop webcams, programmatic ground truth).
+  \item For each subject: use the first 200 frames as calibration (\texttt{ridge\_reg.add\_sample}), the remaining frames as test.
+  \item Run the full Saccade pipeline on each test frame (face detection $\to$ PFLD $\to$ eye patches $\to$ 120-D features $\to$ ridge predict).
+  \item Report mean angular error in degrees per subject; average across 15 subjects.
+\end{enumerate}
+
+Expected result with 200-sample calibration: $3$--$4^\circ$ (between the uncalibrated L2CS-Net baseline and FAZE with 9 samples), assuming no Sugano normalization.
+This would be the first honest apples-to-apples comparison.
+
+\subsection{Effect of Recent Algorithmic Changes}
+
+The following changes were implemented after E11 (smooth pursuit failure):
+CLAHE-based feature extraction (\texttt{src/ridge.rs}),
+chronological decay weights $w_i = \sqrt{1/(n-i)}$,
+hat-matrix LOO shortcut,
+post-calibration residual filtering,
+and EAR-based blink detection.
+
+Offline replay on the saved session (E12, \texttt{examples/replay.rs}) shows:
+
+\begin{itemize}
+  \item \textbf{Decay weights}: no measurable effect on a uniform 25-point calibration grid ($237$\,px with or without). The benefit would appear in long sessions where recent clicks drift away from the calibration region.
+  \item \textbf{Residual filtering}: removes 0--1 samples from a clean session; neutral. The expected benefit is for sessions with blinks or distracted clicks.
+  \item \textbf{CLAHE}: cannot be evaluated from saved sessions (features are pre-extracted pixels, not raw images). A new live recording is required to measure its effect.
+  \item \textbf{Optimal $\lambda$}: auto-tuned to $3\times10^3$ via LOO CV; manual sweeps confirm this is the minimum-error operating point for this session.
+\end{itemize}
+
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% ============================================================
+
+This survey has covered the full algorithmic stack of eye tracking:
+pupil detection (Timm, PuRe, ElSe, DL segmentation);
+appearance-based gaze estimation (MPIIGaze, iTracker, RT-GENE, FAZE, ETH-XGaze, L2CS-Net, GazeTR, UniGaze);
+geometric methods (PCCR, 3D eye model, OpenFace);
+head-pose normalization (Sugano 2014, Zhang 2018);
+temporal filtering (Kalman, 1\euro);
+eye movement classification (I-VT, I-DT, I-HMM);
+calibration and personalisation strategies;
+domain adaptation landscape (PureGaze, RUDA, CauGE, TPGaze, Alfa);
+self-supervised and privacy-preserving gaze (GazeCLR, ELF-UA, PrivatEyes);
+video-based temporal methods (EVE, STAGE);
+uncertainty estimation (SUGE);
+in-the-wild degradation analysis (glasses, low-light, distance, motion);
+facial landmark detector comparison (PFLD, MediaPipe, 3DDFA\_V2, SPIGA);
+and a diagnostic analysis of the Saccade project's CNN experiments.
+
+\textbf{Key findings:}
+
+\begin{enumerate}
+  \item \textbf{Model--normalization compatibility is critical.}
+  The yakhyo gaze models in the Saccade repository are Gaze360-trained with plain face crops (no Sugano normalization).
+  Applying ETH-XGaze normalization to their input is the root cause of the 737 px catastrophe in E8.
+  The mapping is strict: ETH-XGaze models require ETH-XGaze normalization; Gaze360/L2CS-Net models require plain crops.
+
+  \item \textbf{The `bins\_to\_angle` decoding and `run\_gaze` function are correct.}
+  The 90-bin softmax output decoding is implemented correctly.
+  The `run\_gaze` path (plain bounding-box crop) is the correct preprocessing for the existing models.
+  No code changes are needed for these functions --- only the experiment E8 pipeline selection was wrong.
+
+  \item \textbf{Zhang 2018 normalization is correctly implemented in `src/sugano.rs`} ---
+  it matches the ETH-XGaze reference implementation verbatim.
+  The Sugano code is not the bug; the bug was pairing it with incompatible models.
+
+  \item \textbf{9-point calibration is the practical optimum.}
+  The literature uniformly validates 9 points as sufficient for desktop polynomial gaze mapping~\cite{cerrolaza2012polynomial,kar2017review}.
+  Additional samples provide noise averaging but not better coverage.
+
+  \item \textbf{Offset calibration~\cite{chen2020offset} is the easiest CNN upgrade:}
+  Estimate a per-person $(\Delta\text{yaw}, \Delta\text{pitch})$ bias from calibration samples and add it to CNN output.
+  This corrects for kappa angle offset in $\approx20$ lines of code.
+  Expected accuracy: $\approx3$--$4^\circ$ after 9-point calibration.
+
+  \item \textbf{Head translation compensation is achievable without Sugano.}
+  A geometric parallax correction applied to the ridge regression output can compensate for lateral head movement.
+  This is a simple formula requiring only face bounding box tracking (already implemented).
+
+  \item \textbf{SOTA deep learning} (GazeTR-Hybrid, L2CS-Net) achieves $3.5$--$3.9^\circ$ without calibration.
+  FAZE with 9 calibration samples reaches $3.18^\circ$.
+  These numbers are cross-subject, MPIIGaze-protocol.
+  The Saccade project's click-based within-session figure ($142\,\text{px} \approx 2.2^\circ$) is \textit{not directly comparable}~--- see Section~\ref{sec:evaluation}.
+  The honest multi-point out-of-distribution figure ($237\,\text{px} \approx 3.7^\circ$) is comparable to WebGazer.js, and the gap to FAZE ($3.18^\circ$) is real and primarily attributable to the absence of head-pose normalization and cross-subject pre-training.
+
+  \item \textbf{The concrete path forward} in order of effort:
+  \begin{enumerate}
+    \item (0 days) Fix E8: use \texttt{run\_gaze} (plain crop) instead of Sugano for existing models.
+    \item (1 day) Export ETH-XGaze ResNet-50 checkpoint to ONNX and pair it with \texttt{src/sugano.rs} at $224\times224$.
+    \item (1 day) Add offset calibration~\cite{chen2020offset} on top of the ETH-XGaze model.
+    \item (3 days) Implement parallax head-translation correction for the ridge regression baseline.
+    \item (2 weeks) Fix the PnP solver to use Levenberg-Marquardt or EPnP for more accurate head pose.
+    \item (3 weeks) FAZE-style last-layer fine-tuning for $\approx3.18^\circ$ cross-session robustness.
+  \end{enumerate}
+\end{enumerate}
+
+%% ============================================================
+%% BIBLIOGRAPHY
+%% ============================================================
+
+\bibliographystyle{unsrt}
+\bibliography{eye_tracking_survey}
+
+\end{document}
