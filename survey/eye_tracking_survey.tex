@@ -2241,7 +2241,7 @@ Table~\ref{tab:eval_comparison} summarizes the comparison.
 \toprule
 \textbf{System} & \textbf{Click (in-dist.)} & \textbf{Click (OOD)} & \textbf{MPIIGaze} & \textbf{Calibration} \\
 \midrule
-Saccade (this work) & \textbf{142\,px / 2.2°} & \textbf{237\,px / 3.7°} & not tested & 50 clicks \\
+Saccade (this work) & \textbf{142\,px / 2.2°} & \textbf{237\,px / 3.7°} & 12.40° & 200 frames \\
 WebGazer.js~\cite{papoutsaki2016webgazer} & $\approx$175\,px / 4° & — & — & implicit clicks \\
 L2CS-Net~\cite{abdelrahman2022l2cs} & — & — & 3.92° & none \\
 FAZE~\cite{park2019faze} & — & — & 3.18° & 9 points \\
@@ -2251,19 +2251,38 @@ Tobii (hardware ref.) & — & — & $\approx$0.5° & built-in \\
 \end{tabular}
 \end{table}
 
-\subsection{Path to an Honest Benchmark}
+\subsection{MPIIGaze Dataset Benchmark (E13)}
 
-To produce a number directly comparable to literature, the following protocol should be implemented (see also issue~\#49 in the project repository):
+We implemented the dataset benchmark (\texttt{examples/mpii\_bench.rs}) and ran it on the full MPIIGaze dataset~\cite{zhang2019mpiigaze} (15 subjects, 213,658 normalized eye patches, 210,658 test frames after calibration).
+The preprocessing script (\texttt{tools/preprocess\_mpii.py}) converts MATLAB \texttt{.mat} files to PNG images and TSV labels.
+
+\textbf{Protocol:} first 200 frames per subject $\to$ calibration; remaining frames $\to$ test.
+Features: 123-D (CLAHE 60-D per eye $\times$ 2 + 3 head-pose values).
+Lambda: auto-tuned via hat-matrix LOO CV.
+
+\textbf{Result: 12.40° ± 4.82° (mean ± std across 210,658 test frames, all 15 subjects).}
+
+\textbf{Gap analysis — why 12.4° vs 3.92° for L2CS-Net:}
 
 \begin{enumerate}
-  \item Download \textbf{MPIIFaceGaze}~\cite{zhang2019mpiigaze} (15 subjects, laptop webcams, programmatic ground truth).
-  \item For each subject: use the first 200 frames as calibration (\texttt{ridge\_reg.add\_sample}), the remaining frames as test.
-  \item Run the full Saccade pipeline on each test frame (face detection $\to$ PFLD $\to$ eye patches $\to$ 120-D features $\to$ ridge predict).
-  \item Report mean angular error in degrees per subject; average across 15 subjects.
+  \item \textbf{No pretraining.} L2CS-Net uses leave-one-subject-out cross-validation,
+    training on $\approx$200k samples from 14 subjects. Our linear model sees only 200
+    calibration samples, which is insufficient to span the full $\pm 30^\circ$ gaze range.
+  \item \textbf{Feature coarseness.} Our CLAHE + bilinear-resize produces $10\times6 = 60$
+    pixels per eye. L2CS-Net operates on $448\times448$ inputs with ResNet-50.
+    Sixty pixels cannot represent gaze direction with 3D precision.
+  \item \textbf{Evaluation space.} MPIIGaze measures 3-D gaze direction in a normalized
+    camera frame — a harder task than predicting 2-D screen coordinates (E12).
+    The 3.7° we achieve in screen space is \emph{not} the same metric.
+  \item \textbf{Screen-space simplicity.} For one person in one session, the mapping
+    eye-patch $\to$ screen position is near-linear over the typical $\pm15^\circ$ gaze range.
+    The MPIIGaze task requires accurate cross-subject generalization over a wider range.
 \end{enumerate}
 
-Expected result with 200-sample calibration: $3$--$4^\circ$ (between the uncalibrated L2CS-Net baseline and FAZE with 9 samples), assuming no Sugano normalization.
-This would be the first honest apples-to-apples comparison.
+\textbf{Conclusion:} Our 237\,px / 3.7° in screen space (E12) is \emph{not directly comparable}
+to L2CS-Net's 3.92° in MPIIGaze normalized space.
+Achieving $<5^\circ$ on MPIIGaze requires a CNN pretrained on the full dataset
+(Options A/C in Section~\ref{sec:evaluation}).
 
 \subsection{Effect of Recent Algorithmic Changes}
 

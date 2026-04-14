@@ -25,8 +25,12 @@
 //!
 //! # Preprocessed format (MPIIGaze_proc/p00/labels.tsv)
 //!
-//! Header: idx  yaw_rad  pitch_rad  head0  head1  head2
-//! Images: {idx:07d}_left.png and {idx:07d}_right.png  (36×60 grayscale)
+//! Header: idx  gx  gy  gz  head0  head1  head2
+//! Images: {idx:07}_left.png and {idx:07}_right.png  (36×60 grayscale)
+//!
+//! Gaze vector is a 3-D unit vector in MPIIGaze normalized camera frame.
+//! x=right, y=down, z=toward camera.
+//! yaw   = atan2(-gx, -gz)   pitch = asin(-gy)
 //!
 //! # Protocol
 //!
@@ -52,9 +56,9 @@ const LAMBDA_CANDIDATES: &[f64] = &[1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
 struct Sample {
     left_path:  String,
     right_path: String,
-    yaw:        f64,
-    pitch:      f64,
-    head:       [f32; 3],
+    /// 3-D unit gaze vector in MPIIGaze normalized camera frame.
+    gaze: [f64; 3],
+    head: [f32; 3],
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -106,6 +110,7 @@ fn main() {
         // Calibration phase
         for entry in extracted.iter().take(N_CALIB).flatten() {
             let (feats, yaw, pitch) = entry;
+            // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
             reg.add_sample(feats.clone(), (*yaw * 1000.0) as f32, (*pitch * 1000.0) as f32);
         }
 
@@ -123,8 +128,9 @@ fn main() {
             let pred_yaw   = py_scaled as f64 / 1000.0;
             let pred_pitch = pp_scaled as f64 / 1000.0;
 
-            let true_vec  = gaze_from_angles(*true_yaw,  *true_pitch);
-            let pred_vec  = gaze_from_angles(pred_yaw,   pred_pitch);
+            // Angular error: both true and pred as unit vectors
+            let true_vec = gaze_from_angles(*true_yaw, *true_pitch);
+            let pred_vec = gaze_from_angles(pred_yaw,  pred_pitch);
             let dot = (true_vec[0] * pred_vec[0]
                      + true_vec[1] * pred_vec[1]
                      + true_vec[2] * pred_vec[2]).clamp(-1.0, 1.0);
@@ -191,26 +197,26 @@ fn parse_labels(label_path: &str, subject_dir: &str) -> Result<Vec<Sample>, Stri
         if line.is_empty() { continue; }
 
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 6 {
-            eprintln!("  line {lineno}: expected 6 cols, got {}", cols.len());
+        if cols.len() < 7 {
+            eprintln!("  line {lineno}: expected 7 cols, got {}", cols.len());
             continue;
         }
 
         let parse_d = |s: &str| s.parse::<f64>().ok();
         let parse_f = |s: &str| s.parse::<f32>().ok();
 
-        let Some(idx)   = cols[0].parse::<u64>().ok()  else { continue };
-        let Some(yaw)   = parse_d(cols[1])              else { continue };
-        let Some(pitch) = parse_d(cols[2])              else { continue };
-        let Some(h0)    = parse_f(cols[3])              else { continue };
-        let Some(h1)    = parse_f(cols[4])              else { continue };
-        let Some(h2)    = parse_f(cols[5])              else { continue };
+        let Some(idx) = cols[0].parse::<u64>().ok() else { continue };
+        let Some(gx)  = parse_d(cols[1])            else { continue };
+        let Some(gy)  = parse_d(cols[2])            else { continue };
+        let Some(gz)  = parse_d(cols[3])            else { continue };
+        let Some(h0)  = parse_f(cols[4])            else { continue };
+        let Some(h1)  = parse_f(cols[5])            else { continue };
+        let Some(h2)  = parse_f(cols[6])            else { continue };
 
         samples.push(Sample {
             left_path:  format!("{subject_dir}/{idx:07}_left.png"),
             right_path: format!("{subject_dir}/{idx:07}_right.png"),
-            yaw,
-            pitch,
+            gaze: [gx, gy, gz],
             head: [h0, h1, h2],
         });
     }
@@ -234,6 +240,16 @@ fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
     let l_feat = ridge::extract_eye_features(&left_gray,  lw, lh);
     let r_feat = ridge::extract_eye_features(&right_gray, rw, rh);
 
+    // Convert 3-D unit gaze vector → yaw/pitch angles.
+    // MPIIGaze convention: x=right, y=down, z=toward camera.
+    // yaw   = atan2(-gx, -gz)  (positive = looking left from subject's POV)
+    // pitch = asin(-gy)        (positive = looking up)
+    let [gx, gy, gz] = s.gaze;
+    let norm = (gx*gx + gy*gy + gz*gz).sqrt();
+    if norm < 1e-6 { return None; }
+    let yaw   = (-gx / norm).atan2(-gz / norm);
+    let pitch = ((-gy) / norm).asin();
+
     let mut feats = Vec::with_capacity(FEAT_LEN);
     feats.extend_from_slice(&l_feat);
     feats.extend_from_slice(&r_feat);
@@ -241,7 +257,7 @@ fn extract_features(s: &Sample) -> Option<(Vec<f32>, f64, f64)> {
     feats.push(s.head[1]);
     feats.push(s.head[2]);
 
-    Some((feats, s.yaw, s.pitch))
+    Some((feats, yaw, pitch))
 }
 
 // ─── Geometry helpers ────────────────────────────────────────────────────────
