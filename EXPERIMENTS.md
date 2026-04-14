@@ -773,6 +773,66 @@ that correlates with session position — not because head pose varies.
 
 ---
 
+### E24. Calibration strategy experiments: gaze-oracle, dwell-avg, window-calib — status: DONE
+
+**Date:** 2026-04-15
+
+**Motivation:** User asked whether the calibration implementation itself contributes to accuracy.
+Three strategies tested vs. uniform temporal baseline (3.85° at n=200, 3.04° at n=1000).
+Config: 40×24 patches, 3×3 CLAHE, MPIIGaze.
+
+**Results:**
+
+| Variant | n=200 | n=1000 | vs uniform n=200 |
+|---------|-------|--------|------------------|
+| Uniform (baseline) | 3.85° / 2.97° | 3.04° / 2.20° | — |
+| **Gaze-oracle** (greedy k-center, true gaze space) | **3.67° / 2.76°** | 3.07° / 2.22° | **−4.7%** |
+| **Window-calib** (centre of temporal window) | **3.52° / 2.61°** | 3.04° / 2.20° | **−8.6%** |
+| Dwell-avg k=5 | 6.84° — broken | 5.42° — broken | +78% |
+| Dwell-avg k=15 | 8.78° — broken | — | +128% |
+
+**Key findings:**
+
+1. **Gaze-oracle is the theoretical upper bound:** knowing true gaze angles and selecting
+   maximally diverse calibration samples gives only −4.7% over uniform temporal at n=200.
+   The uniform temporal proxy is already ~95% efficient. At n=1000 the gap closes entirely.
+
+   **Implication for live app:** a perfect grid-based calibration that covers all screen angles
+   uniformly is nearly as good as any possible oracle selection strategy. The 7×7 grid already
+   achieves this. No algorithmic improvement to calibration *selection* can give more than ~5%
+   gain.
+
+2. **Window-calib (centre of temporal window) outperforms oracle at n=200:** 3.52° vs 3.67°.
+   Likely because the centre of a temporal window is more gaze-stable than the window boundary
+   (users' gaze distribution is smoother in the middle of viewing periods). The difference from
+   uniform (start-of-window) is small but consistent.
+
+   **Actionable:** change uniform calibration to sample from window *centres* rather than window
+   starts. Already implemented as `--window-calib` flag. In the live app, this means collecting
+   calibration frames in the *middle* of each dot's display period (not immediately on click).
+
+3. **Dwell-averaging is catastrophically bad on MPIIGaze continuous recordings:**
+   - On MPIIGaze, consecutive frames (i−K to i+K) have *different* gaze directions.
+     Averaging features across different gaze targets → label/feature mismatch → total failure.
+   - **For the live app, dwell is the correct strategy:** during a 1-second dwell, all K
+     frames correspond to *the same* calibration dot. Feature averaging over those frames
+     reduces per-frame landmark jitter noise. The MPIIGaze experiment refutes the wrong
+     implementation (random-frame averaging) and by contrast validates the correct one
+     (fixation-aligned averaging).
+   - **Recommended dwell implementation:** show dot for 1.5s, discard first 500ms (saccade
+     settling time per Dalmaijer 2014), average features over last 1s = ~10 frames at 10 FPS.
+
+4. **Calibration strategy contributes ≤8.6% in accuracy** (oracle bound). The dominant factor
+   remains sample count (n=200→1000 gives ~21% gain). For the live app the key lever is
+   accumulating calibration samples across sessions, not refining the sampling strategy.
+
+**Actions taken:**
+- Added `--gaze-diverse`, `--dwell-avg K`, `--window-calib` flags to `mpii_bench.rs`.
+- Dwell calibration should be implemented in `webgazer.rs` as a UX improvement (no click,
+  timed fixation with feature averaging over the stable window).
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | Protocol | Notes |

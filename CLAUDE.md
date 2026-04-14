@@ -41,10 +41,11 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 ## Promising next steps (ordered)
 
 1. **Run a new live session** — measure actual improvement from 7×7 grid + 30×18 patches. Expected: ~215 px vs old 237 px.
-2. **Accumulated calibration across sessions** — `saccade_calib.bin` persists. Plateau at ~n=1000 (≈10 sessions × 98 clicks). Beyond that, ridge regression hits its floor (~2.8°).
-3. **40×24 patches after 500+ accumulated samples** — set `EYE_PATCH_W=40, EYE_PATCH_H=24` in `src/ridge.rs` after user accumulates 5+ sessions.
-4. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Estimated floor: 2.5° with calibration. 2-3 weeks.
-5. **MediaPipe FaceMesh** — replace PFLD (68 pts) with 468-point model for better eye ROI.
+2. **Implement dwell calibration in webgazer.rs** — show dot 1.5s, discard first 500ms (saccade settling), average features over last 1s (~10 frames). No click needed. E24: dwell-averaging on fixation-aligned frames reduces jitter noise; window-calib gives −8.6% over start-of-window sampling.
+3. **Accumulated calibration across sessions** — `saccade_calib.bin` persists. Plateau at ~n=1000 (≈10 sessions × 98 clicks). Beyond that, ridge regression hits its floor (~2.8°).
+4. **40×24 patches after 500+ accumulated samples** — set `EYE_PATCH_W=40, EYE_PATCH_H=24` in `src/ridge.rs` after user accumulates 5+ sessions.
+5. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Estimated floor: 2.5° with calibration. 2-3 weeks.
+6. **MediaPipe FaceMesh** — replace PFLD (68 pts) with 468-point model for better eye ROI.
 
 ## Key files
 

@@ -78,6 +78,12 @@ fn main() {
     let mut multi_scale = false;
     // diverse-calib: greedily select calibration samples to maximize head-pose space coverage
     let mut diverse_calib = false;
+    // gaze-diverse: greedy k-center in TRUE gaze angle space (oracle / theoretical upper bound)
+    let mut gaze_diverse = false;
+    // dwell-avg: average features over K frames around each calibration sample (simulates dwell fixation)
+    let mut dwell_k: usize = 1;
+    // window-calib: divide session into n_calib windows, take 1 uniform sample per window
+    let mut window_calib = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -109,6 +115,11 @@ fn main() {
             "--fine-lambda"        => fine_lambda = true,
             "--multi-scale"        => multi_scale = true,
             "--diverse-calib"      => diverse_calib = true,
+            "--gaze-diverse"       => gaze_diverse = true,
+            "--dwell-avg" => {
+                dwell_k = args.next().expect("--dwell-avg K").parse().expect("K");
+            }
+            "--window-calib"       => window_calib = true,
             s if !s.starts_with('-') => proc_root = s.to_string(),
             _ => eprintln!("unknown arg: {arg}"),
         }
@@ -127,12 +138,14 @@ fn main() {
 
     let feat_desc = if use_gradient { "CLAHE+SobelX" } else { "CLAHE" };
     let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
-    let calib_desc = if diverse_calib { "diverse-headpose" } else if uniform_calib { "uniform" } else { "first" };
+    let calib_desc = if gaze_diverse { "gaze-oracle" } else if window_calib { "windowed" }
+                    else if diverse_calib { "diverse-headpose" } else if uniform_calib { "uniform" } else { "first" };
+    let dwell_desc = if dwell_k > 1 { format!(", dwell-avg={dwell_k}") } else { String::new() };
     let clahe_desc = format!("tiles={clahe_tx}×{clahe_ty} clip={clahe_clip}");
     let scale_desc = if multi_scale { format!("+{coarse_w}×{coarse_h}coarse") } else { String::new() };
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
     println!("Protocol: {calib_desc} {n_calib} frames/subject = calibration, rest = test");
-    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h}{scale_desc} [{clahe_desc}] eye patches + 3 head-pose{flip_desc})");
+    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h}{scale_desc} [{clahe_desc}] eye patches + 3 head-pose{flip_desc}{dwell_desc})");
     println!();
 
     let mut all_errors: Vec<f64> = Vec::new();
@@ -166,9 +179,57 @@ fn main() {
                                       multi_scale, coarse_w, coarse_h))
             .collect();
 
-        // Select calibration indices (first N, uniformly spread, or head-pose diverse)
+        // Select calibration indices
         let n_total = extracted.len();
-        let calib_indices: Vec<usize> = if diverse_calib {
+        let calib_indices: Vec<usize> = if gaze_diverse {
+            // Greedy k-center in TRUE gaze angle space (oracle — uses ground truth labels).
+            // Theoretical upper bound for diversity-based calibration selection.
+            let gazes: Vec<(f64, f64)> = samples.iter().map(|s| {
+                let [gx, gy, gz] = s.gaze;
+                let norm = (gx*gx+gy*gy+gz*gz).sqrt().max(1e-9);
+                let yaw   = (-gx/norm).atan2(-gz/norm);
+                let pitch = ((-gy)/norm).asin();
+                (yaw, pitch)
+            }).collect();
+            let gaze_dist = |a: usize, b: usize| -> f64 {
+                let dy = gazes[a].0 - gazes[b].0;
+                let dp = gazes[a].1 - gazes[b].1;
+                (dy*dy + dp*dp).sqrt()
+            };
+            let mean_g = {
+                let my = gazes.iter().map(|g| g.0).sum::<f64>() / n_total as f64;
+                let mp = gazes.iter().map(|g| g.1).sum::<f64>() / n_total as f64;
+                (my, mp)
+            };
+            let seed = (0..n_total).min_by(|&a, &b| {
+                let da = ((gazes[a].0-mean_g.0).powi(2)+(gazes[a].1-mean_g.1).powi(2)).sqrt();
+                let db = ((gazes[b].0-mean_g.0).powi(2)+(gazes[b].1-mean_g.1).powi(2)).sqrt();
+                da.partial_cmp(&db).unwrap()
+            }).unwrap_or(0);
+            let mut selected = vec![seed];
+            let mut is_sel = vec![false; n_total];
+            is_sel[seed] = true;
+            let mut dist_to_set: Vec<f64> = (0..n_total).map(|i| gaze_dist(i, seed)).collect();
+            while selected.len() < n_calib.min(n_total) {
+                let next = (0..n_total).filter(|&i| !is_sel[i])
+                    .max_by(|&a, &b| dist_to_set[a].partial_cmp(&dist_to_set[b]).unwrap())
+                    .unwrap();
+                is_sel[next] = true;
+                for i in 0..n_total {
+                    let d = gaze_dist(i, next);
+                    if d < dist_to_set[i] { dist_to_set[i] = d; }
+                }
+                selected.push(next);
+            }
+            selected
+        } else if window_calib {
+            // Session divided into n_calib equal windows; take centre frame of each window.
+            // Simulates accumulating one calibration sample per distinct "session segment".
+            (0..n_calib)
+                .map(|i| (i * n_total / n_calib) + (n_total / n_calib / 2).min(n_total - 1 - i * n_total / n_calib))
+                .map(|i| i.min(n_total - 1))
+                .collect()
+        } else if diverse_calib {
             // Greedy k-center in head pose space: maximize minimum pairwise distance.
             // Seed with the sample closest to the mean head pose, then greedily add
             // the sample furthest from the current selected set.
@@ -223,6 +284,31 @@ fn main() {
         };
         let calib_set: std::collections::HashSet<usize> = calib_indices.iter().copied().collect();
 
+        // Dwell-averaging: replace each calibration sample's features with the mean of
+        // dwell_k frames centred on it. Simulates holding fixation during dwell calibration —
+        // multiple frames are averaged, reducing per-frame landmark jitter noise.
+        // (dwell_k=1 is the default, i.e., no averaging)
+        let get_calib_feat = |center: usize, feat_len: usize| -> Option<(Vec<f32>, f64, f64)> {
+            if dwell_k <= 1 {
+                return extracted[center].clone();
+            }
+            let half = dwell_k / 2;
+            let start = center.saturating_sub(half);
+            let end = (center + half + 1).min(n_total);
+            let (_, ref_yaw, ref_pitch) = extracted[center].as_ref()?;
+            let mut sum = vec![0.0f32; feat_len];
+            let mut count = 0usize;
+            for k in start..end {
+                if let Some((ref feats, _, _)) = extracted[k] {
+                    for (j, &v) in feats.iter().enumerate() { sum[j] += v; }
+                    count += 1;
+                }
+            }
+            if count == 0 { return None; }
+            let avg: Vec<f32> = sum.iter().map(|&v| v / count as f32).collect();
+            Some((avg, *ref_yaw, *ref_pitch))
+        };
+
         let calib_count = calib_indices.iter()
             .filter(|&&i| extracted[i].is_some()).count();
 
@@ -264,19 +350,16 @@ fn main() {
         let mut reg_l = RidgeRegressor::new(n_calib + 10, 1e4, eye_feat_len);
         let mut reg_r = RidgeRegressor::new(n_calib + 10, 1e4, eye_feat_len);
 
-        // Calibration phase
+        // Calibration phase (uses dwell-averaged features if dwell_k > 1)
         for &i in &calib_indices {
-            if let Some((feats, yaw, pitch)) = &extracted[i] {
-                let feats_n = normalize(feats);
-                let target_x = (*yaw * 1000.0) as f32;
-                let target_y = (*pitch * 1000.0) as f32;
+            if let Some((feats, yaw, pitch)) = get_calib_feat(i, feat_len) {
+                let feats_n = normalize(&feats);
+                let target_x = (yaw * 1000.0) as f32;
+                let target_y = (pitch * 1000.0) as f32;
                 if separate_eyes {
-                    // Left eye: first eye_feat_len features
                     reg_l.add_sample(feats_n[..eye_feat_len].to_vec(), target_x, target_y);
-                    // Right eye: next eye_feat_len features
                     reg_r.add_sample(feats_n[eye_feat_len..eye_feat_len*2].to_vec(), target_x, target_y);
                 } else {
-                    // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
                     reg.add_sample(feats_n, target_x, target_y);
                 }
             }
