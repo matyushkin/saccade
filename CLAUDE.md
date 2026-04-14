@@ -9,12 +9,12 @@ Goal: minimize pixel error on multi-point live validation.
 |--------|-------|------------|--------|
 | Live (honest multi-point) | **237 px** | E12 | old 5×5/20×12 — needs new session with 7×7/30×18 |
 | MPIIGaze (first-N protocol) | **5.31°** | E15 | 20×12, n_calib=500 |
-| MPIIGaze (uniform-calib, n=200) | **3.70° / 2.82° median** | E17 | 30×18, uniform sampling |
-| MPIIGaze (uniform-calib, n=200) | **3.54° / 2.40°** | E18 | 30×18, 3×3 CLAHE, uniform |
-| MPIIGaze (uniform-calib, n=1000) | **3.04° / 2.20° median** | E18 | 40×24, 3×3 CLAHE, uniform — best ever |
+| MPIIGaze (uniform, n=1000) | **3.04° / 2.20° median** | E18 | 40×24, 3×3 CLAHE — beats FAZE |
+| MPIIGaze (uniform, n=2000) | 2.94° / 2.12° | E20 | 40×24, 3×3 CLAHE — 12/15 subjects |
+| MPIIGaze (uniform, n=5000) | 2.83° / 2.04° | E20 | 40×24, 3×3 CLAHE — 10/15 subjects |
 
 Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 3.43° (no calib).
-**E16-E18: calibration diversity + larger patches + 3×3 CLAHE = 3.04° — beats FAZE by 4.4%.**
+**Effective floor for ridge regression: ~2.8° (E20). Beating this requires CNN/Sugano.**
 
 ## DO NOT RETRY — dead ends
 
@@ -33,13 +33,15 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 | Separate per-eye regressors + average (E19) | 3.64° vs 3.54° — worse; loses binocular correlations between eyes | — |
 | Head pose removal (E19) | 3.54° — neutral; head pose features contribute negligibly | — |
 | Wide aspect ratio patches 40×12 (E19) | 3.61° — worse; 30×18 (5:3 ratio) better | — |
+| Multi-scale features 40×24+20×12 (E21) | 3.06° at n=1000 vs 3.04° single-scale — neutral; marginal at n=500 | — |
+| n_calib > 1000 for ridge (E20) | Curve flattening: n=1000→3.04°, n=5000→2.83° — only 0.21° gain for 5× more data | Only if accumulating many sessions passively |
 
 ## Promising next steps (ordered)
 
 1. **Run a new live session** — measure actual improvement from 7×7 grid + 30×18 patches. Expected: ~215 px vs old 237 px.
-2. **Accumulated calibration across sessions** — `saccade_calib.bin` persists. After ~500 total clicks (≈5 sessions × 98 clicks), upgrade to 40×24 patches for best results.
-3. **40×24 patches** — better than 30×18 at n≥500; set `EYE_PATCH_W=40, EYE_PATCH_H=24` after accumulating enough data.
-4. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Expected: ~3.92° without calib → better with calib. 2-3 weeks.
+2. **Accumulated calibration across sessions** — `saccade_calib.bin` persists. Plateau at ~n=1000 (≈10 sessions × 98 clicks). Beyond that, ridge regression hits its floor (~2.8°).
+3. **40×24 patches after 500+ accumulated samples** — set `EYE_PATCH_W=40, EYE_PATCH_H=24` in `src/ridge.rs` after user accumulates 5+ sessions.
+4. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Estimated floor: 2.5° with calibration. 2-3 weeks.
 5. **MediaPipe FaceMesh** — replace PFLD (68 pts) with 468-point model for better eye ROI.
 
 ## Key files

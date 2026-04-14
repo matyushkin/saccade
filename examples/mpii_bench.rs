@@ -44,6 +44,7 @@ use saccade::ridge::{self, RidgeRegressor};
 
 /// Lambda candidates for auto-tuning.
 const LAMBDA_CANDIDATES: &[f64] = &[1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+const LAMBDA_FINE: &[f64] = &[1e1, 3e1, 1e2, 3e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 3e6];
 
 // ─── Data types ─────────────────────────────────────────────────────────────
 
@@ -58,7 +59,7 @@ struct Sample {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Parse args: [proc_root] [--patch WxH] [--n-calib N] [--flip-right] [--gradient]
+    // Parse args: [proc_root] [--patch WxH] [--n-calib N] [--flip-right] [--gradient] [--multi-scale]
     let mut proc_root = "MPIIGaze_proc".to_string();
     let mut patch_w: usize = 20;
     let mut patch_h: usize = 12;
@@ -72,6 +73,9 @@ fn main() {
     let mut normalize_feats = false;
     let mut no_head_pose = false;
     let mut separate_eyes = false;
+    let mut fine_lambda = false;
+    // multi-scale: concatenate two CLAHE patches per eye (primary patch + half-scale coarse patch)
+    let mut multi_scale = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -100,13 +104,21 @@ fn main() {
             "--normalize-features" => normalize_feats = true,
             "--no-head-pose"       => no_head_pose = true,
             "--separate-eyes"      => separate_eyes = true,
+            "--fine-lambda"        => fine_lambda = true,
+            "--multi-scale"        => multi_scale = true,
             s if !s.starts_with('-') => proc_root = s.to_string(),
             _ => eprintln!("unknown arg: {arg}"),
         }
     }
 
-    // Feature length: pixels per eye × 2 eyes (×2 if gradient appended) + 3 head pose
-    let feat_per_eye = patch_w * patch_h * if use_gradient { 2 } else { 1 };
+    // Coarse patch = half resolution of primary (rounded down, min 4)
+    let coarse_w = (patch_w / 2).max(4);
+    let coarse_h = (patch_h / 2).max(4);
+
+    // Feature length: pixels per eye × 2 eyes (×2 if gradient appended) + coarse if multi-scale + 3 head pose
+    let fine_per_eye = patch_w * patch_h * if use_gradient { 2 } else { 1 };
+    let coarse_per_eye = if multi_scale { coarse_w * coarse_h } else { 0 };
+    let feat_per_eye = fine_per_eye + coarse_per_eye;
     let head_feat_len = if no_head_pose { 0 } else { 3 };
     let feat_len = feat_per_eye * 2 + head_feat_len;
 
@@ -114,9 +126,10 @@ fn main() {
     let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
     let calib_desc = if uniform_calib { "uniform" } else { "first" };
     let clahe_desc = format!("tiles={clahe_tx}×{clahe_ty} clip={clahe_clip}");
+    let scale_desc = if multi_scale { format!("+{coarse_w}×{coarse_h}coarse") } else { String::new() };
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
     println!("Protocol: {calib_desc} {n_calib} frames/subject = calibration, rest = test");
-    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h} [{clahe_desc}] eye patches + 3 head-pose{flip_desc})");
+    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h}{scale_desc} [{clahe_desc}] eye patches + 3 head-pose{flip_desc})");
     println!();
 
     let mut all_errors: Vec<f64> = Vec::new();
@@ -145,7 +158,9 @@ fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let extracted: Vec<Option<(Vec<f32>, f64, f64)>> = samples.iter()
-            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient, clahe_tx, clahe_ty, clahe_clip, no_head_pose))
+            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient,
+                                      clahe_tx, clahe_ty, clahe_clip, no_head_pose,
+                                      multi_scale, coarse_w, coarse_h))
             .collect();
 
         // Select calibration indices (first N, or uniformly spread across session)
@@ -220,10 +235,11 @@ fn main() {
         }
 
         // Auto-tune lambda via LOO CV
+        let lam_grid = if fine_lambda { LAMBDA_FINE } else { LAMBDA_CANDIDATES };
         if separate_eyes {
-            if let Some(lam) = reg_l.auto_lambda(LAMBDA_CANDIDATES) { reg_l.set_lambda(lam); }
-            if let Some(lam) = reg_r.auto_lambda(LAMBDA_CANDIDATES) { reg_r.set_lambda(lam); }
-        } else if let Some(best_lam) = reg.auto_lambda(LAMBDA_CANDIDATES) {
+            if let Some(lam) = reg_l.auto_lambda(lam_grid) { reg_l.set_lambda(lam); }
+            if let Some(lam) = reg_r.auto_lambda(lam_grid) { reg_r.set_lambda(lam); }
+        } else if let Some(best_lam) = reg.auto_lambda(lam_grid) {
             reg.set_lambda(best_lam);
         }
 
@@ -394,6 +410,7 @@ fn sobel_x_features(clahe: &[f32], w: usize, h: usize) -> Vec<f32> {
 }
 
 /// Extract features from one sample. Returns (features, yaw_rad, pitch_rad) or None.
+#[allow(clippy::too_many_arguments)]
 fn extract_features(
     s: &Sample,
     patch_w: usize,
@@ -404,6 +421,9 @@ fn extract_features(
     clahe_ty: usize,
     clahe_clip: f32,
     no_head_pose: bool,
+    multi_scale: bool,
+    coarse_w: usize,
+    coarse_h: usize,
 ) -> Option<(Vec<f32>, f64, f64)> {
     let load_gray = |path: &str| -> Option<(Vec<u8>, usize, usize)> {
         let img = ImageReader::open(path).ok()?.decode().ok()?.into_luma8();
@@ -419,7 +439,7 @@ fn extract_features(
         right_gray_raw
     };
 
-    // Patches are single-channel (grayscale PNG from preprocessor)
+    // Primary (fine) patch features
     let l_feat = ridge::extract_eye_features_gray_sized_clahe(&left_gray,  lw, lh, patch_w, patch_h, clahe_tx, clahe_ty, clahe_clip);
     let r_feat = ridge::extract_eye_features_gray_sized_clahe(&right_gray, rw, rh, patch_w, patch_h, clahe_tx, clahe_ty, clahe_clip);
 
@@ -433,6 +453,16 @@ fn extract_features(
         [r_feat, grad].concat()
     } else { r_feat };
 
+    // Optionally append coarse-scale patch features (half resolution, independent CLAHE)
+    let l_feat = if multi_scale {
+        let coarse = ridge::extract_eye_features_gray_sized_clahe(&left_gray, lw, lh, coarse_w, coarse_h, clahe_tx, clahe_ty, clahe_clip);
+        [l_feat, coarse].concat()
+    } else { l_feat };
+    let r_feat = if multi_scale {
+        let coarse = ridge::extract_eye_features_gray_sized_clahe(&right_gray, rw, rh, coarse_w, coarse_h, clahe_tx, clahe_ty, clahe_clip);
+        [r_feat, coarse].concat()
+    } else { r_feat };
+
     // Convert 3-D unit gaze vector → yaw/pitch angles.
     // MPIIGaze convention: x=right, y=down, z=toward camera.
     // yaw   = atan2(-gx, -gz)  (positive = looking left from subject's POV)
@@ -443,9 +473,7 @@ fn extract_features(
     let yaw   = (-gx / norm).atan2(-gz / norm);
     let pitch = ((-gy) / norm).asin();
 
-    let head_feat_len = if no_head_pose { 0 } else { 3 };
-    let feat_len = patch_w * patch_h * 2 + head_feat_len;
-    let mut feats = Vec::with_capacity(feat_len);
+    let mut feats = Vec::with_capacity(l_feat.len() + r_feat.len() + 3);
     feats.extend_from_slice(&l_feat);
     feats.extend_from_slice(&r_feat);
     if !no_head_pose {

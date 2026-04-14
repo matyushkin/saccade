@@ -625,6 +625,69 @@ each tile is 10×6 px ≈ pupil diameter — natural spatial scale for local nor
 
 ---
 
+### E20. n_calib scaling curve — status: DONE (diminishing returns above n=1000)
+
+**Date:** 2026-04-15
+
+**Config:** 40×24 patches, 3×3 CLAHE tiles, uniform calibration (best config from E18).
+
+**Scaling curve:**
+
+| n_calib | Mean error | Median | Subjects | Notes |
+|---------|-----------|--------|---------|-------|
+| 200  | 3.85° | 2.97° | 15/15 | E16 |
+| 500  | 3.30° | 2.44° | 15/15 | E17 |
+| 1000 | 3.04° | 2.20° | 15/15 | E18 |
+| **2000** | **2.94°** | **2.12°** | 12/15 | 3 small subjects excluded |
+| **5000** | **2.83°** | **2.04°** | 10/15 | 5 small subjects excluded |
+
+**Key findings:**
+
+1. **Curve is flattening.** n=1000→5000 saves only 0.21° mean. The bottleneck has shifted
+   from calibration quantity to something else (likely head pose drift / non-stationarity
+   within long recording sessions).
+
+2. **Subject exclusion at high n:** MPIIGaze subjects p10–p14 have only 1500–2980 samples.
+   At n=2000 three subjects drop out; at n=5000 five drop out. The comparison isn't fully
+   apples-to-apples, but the trend is unambiguous.
+
+3. **Live app implication:** Accumulating calibration across sessions gives real returns up to
+   ~n=1000 (≈10 sessions × 98 clicks). Beyond that, improvement is marginal.
+   Don't prompt users to re-calibrate more than necessary — use accumulated data.
+
+**Status:** Dead end for major gains. Infrastructure in place via `saccade_calib.bin`.
+
+---
+
+### E21. Multi-scale features (40×24 + 20×12 coarse) — status: DONE (neutral, not worth it)
+
+**Date:** 2026-04-15
+
+**Motivation:** Different spatial scales capture different image statistics. Primary patch (40×24)
+captures fine iris texture; coarse patch (20×12) captures global iris geometry. Hypothetically
+complementary.
+
+**Implementation:** `--multi-scale` flag in `mpii_bench.rs`. For each eye: extract 40×24 CLAHE
+features + 20×12 CLAHE features (independent, same tiles/clip), concatenate → 480+240=720-D
+per eye, 1443-D total (vs 963-D single-scale). Wait, actually: 40×24=960 per eye + 20×12=240
+per eye = 1200 per eye × 2 + 3 = 2403-D total.
+
+**Results (40×24+20×12 coarse, 3×3 CLAHE, uniform):**
+
+| n_calib | Multi-scale | Single-scale | Delta |
+|---------|------------|-------------|-------|
+| 500  | 3.22° / 2.35° med | 3.30° / 2.44° med | −2.4% mean |
+| 1000 | 3.06° / 2.24° med | 3.04° / 2.20° med | +0.7% (same) |
+
+**Conclusion:** Multi-scale gives a marginal improvement at n=500 but is essentially neutral
+at n=1000. The coarse-scale features add noise at high n without informational value (the fine
+patch already captures the coarse structure at lower frequency). Not worth the extra feature
+extraction time and 25% larger feature vector.
+
+**Dead end.** Single-scale 40×24 remains the best.
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | Protocol | Notes |
@@ -632,11 +695,11 @@ each tile is 10×6 px ≈ pupil diameter — natural spatial scale for local nor
 | **`webgazer.rs` live, 5×5 grid, 20×12, 2×2 CLAHE** | **237 px / 3.7°** | Honest multi-point (E12) | Old best live |
 | mpii_bench, 20×12, n=500, first-N | 5.31° | Standard MPIIGaze (E15) | Conservative benchmark |
 | mpii_bench, 20×12, n=200, uniform-calib | 3.85° | Uniform (E16) | Beats L2CS-Net |
-| mpii_bench, 30×18, n=200, uniform-calib, 2×2 | 3.70° | Uniform (E17) | — |
 | mpii_bench, 30×18, n=200, uniform-calib, 3×3 | 3.54° | Uniform (E18) | +4% from CLAHE tiles |
-| mpii_bench, 30×18, n=500, uniform-calib, 3×3 | 3.24° | Uniform (E18) | ~n=98 live est. |
-| mpii_bench, 40×24, n=1000, uniform-calib, 2×2 | 3.14° / 2.31° | Uniform (E17) | Beats FAZE |
+| mpii_bench, 30×18, n=500, uniform-calib, 3×3 | 3.24° | Uniform (E18) | — |
 | **mpii_bench, 40×24, n=1000, uniform-calib, 3×3** | **3.04° / 2.20°** | **Uniform (E18)** | **Best ever — FAZE-4.4%** |
+| mpii_bench, 40×24, n=2000, uniform-calib, 3×3 | 2.94° / 2.12° | Uniform (E20, 12/15) | Curve flattening |
+| mpii_bench, 40×24, n=5000, uniform-calib, 3×3 | 2.83° / 2.04° | Uniform (E20, 10/15) | Floor ~2.8° for this approach |
 | WebGazer.js (reference) | ~175 px / 4° | Browser click-based | Has continuous learning |
 | L2CS-Net | 3.92° | No calibration | Cross-subject DNN |
 | FAZE | 3.18° | 9-point calib | Meta-learned fine-tune |
@@ -646,9 +709,12 @@ each tile is 10×6 px ≈ pupil diameter — natural spatial scale for local nor
 **Current state:** The 30×18 patch + 7×7 calibration grid is deployed in `webgazer.rs`.
 Expected live improvement: 237 px → ~215 px. New session needed to measure actual improvement.
 
+**Effective floor for ridge regression:** ~2.8° with unlimited calibration data (E20).
+Beating this requires either more expressive features or a better model (CNN/Sugano).
+
 Going to <150 px live requires (in priority order):
-1. **Accumulated calibration across sessions** — free, existing infrastructure, just use it longer
-2. **40×24 patch** — better but slower solve; only worth it if n_calib ≥ 500 (5+ sessions)
+1. **Accumulated calibration across sessions** — free, existing infrastructure; plateau at ~n=1000
+2. **Switch to 40×24 after ≥500 accumulated samples** — faster solve and better accuracy
 3. Production Sugano normalization → CNN approach (2-3 weeks)
 
 The white background, CLAHE, decay weights, blink filtering, and residual
